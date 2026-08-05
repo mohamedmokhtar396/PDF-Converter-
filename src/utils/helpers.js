@@ -177,3 +177,103 @@ export function sanitizeFileName(name, defaultExt = '') {
   return cleaned;
 }
 
+/**
+ * Auto-detect document edges / non-blank content boundaries for AI Auto-Crop (0-100%)
+ * @param {HTMLCanvasElement | HTMLImageElement} source
+ * @returns {Promise<{x: number, y: number, w: number, h: number}>} Crop percentages (0..100)
+ */
+export async function detectDocumentCropBounds(source) {
+  return new Promise((resolve) => {
+    try {
+      const sampleWidth = 320;
+      let imgW = source.width || source.naturalWidth || 800;
+      let imgH = source.height || source.naturalHeight || 600;
+      const sampleHeight = Math.round((imgH * sampleWidth) / imgW);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = sampleWidth;
+      canvas.height = sampleHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(source, 0, 0, sampleWidth, sampleHeight);
+
+      const imageData = ctx.getImageData(0, 0, sampleWidth, sampleHeight);
+      const data = imageData.data;
+
+      // Sample corner pixels to estimate background color (desk or page border)
+      const cornerSamples = [
+        [0, 0],
+        [sampleWidth - 1, 0],
+        [0, sampleHeight - 1],
+        [sampleWidth - 1, sampleHeight - 1],
+      ];
+
+      let bgR = 0, bgG = 0, bgB = 0;
+      cornerSamples.forEach(([cx, cy]) => {
+        const idx = (cy * sampleWidth + cx) * 4;
+        bgR += data[idx];
+        bgG += data[idx + 1];
+        bgB += data[idx + 2];
+      });
+      bgR = Math.round(bgR / 4);
+      bgG = Math.round(bgG / 4);
+      bgB = Math.round(bgB / 4);
+
+      let minX = sampleWidth, minY = sampleHeight, maxX = 0, maxY = 0;
+      let detectedCount = 0;
+
+      for (let y = 0; y < sampleHeight; y++) {
+        for (let x = 0; x < sampleWidth; x++) {
+          const idx = (y * sampleWidth + x) * 4;
+          const r = data[idx];
+          const g = data[idx + 1];
+          const b = data[idx + 2];
+
+          // Calculate color difference from background
+          const diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
+          
+          // Also check luminance contrast from white/dark borders
+          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+
+          if (diff > 35 || lum < 220) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            detectedCount++;
+          }
+        }
+      }
+
+      // If document edge detected cleanly
+      if (detectedCount > 100 && maxX > minX && maxY > minY) {
+        // Add 1.5% padding margin
+        const padX = Math.round(sampleWidth * 0.015);
+        const padY = Math.round(sampleHeight * 0.015);
+
+        const cropX = Math.max(0, minX - padX);
+        const cropY = Math.max(0, minY - padY);
+        const cropW = Math.min(sampleWidth - cropX, (maxX - minX) + (padX * 2));
+        const cropH = Math.min(sampleHeight - cropY, (maxY - minY) + (padY * 2));
+
+        const pctX = Math.round((cropX / sampleWidth) * 100);
+        const pctY = Math.round((cropY / sampleHeight) * 100);
+        const pctW = Math.round((cropW / sampleWidth) * 100);
+        const pctH = Math.round((cropH / sampleHeight) * 100);
+
+        // Ensure minimum 20% size
+        if (pctW >= 20 && pctH >= 20) {
+          resolve({ x: pctX, y: pctY, w: Math.min(100 - pctX, pctW), h: Math.min(100 - pctY, pctH) });
+          return;
+        }
+      }
+
+      // Default fallback: 100% full content
+      resolve({ x: 0, y: 0, w: 100, h: 100 });
+    } catch (e) {
+      console.warn('Auto-crop detection error:', e);
+      resolve({ x: 0, y: 0, w: 100, h: 100 });
+    }
+  });
+}
+
+
