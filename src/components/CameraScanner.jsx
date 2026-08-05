@@ -1,16 +1,17 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Camera, RefreshCw, Check, X, RotateCw, Wand2, Image as ImageIcon, Sparkles, Maximize, Crop, Scissors, Sparkle } from 'lucide-react';
+import { Camera, RefreshCw, Check, X, RotateCw, Wand2, Image as ImageIcon, Sparkles, Maximize, Crop, Scissors, CheckCircle2 } from 'lucide-react';
 import { applyScanFilterToCanvas, detectDocumentCropBounds } from '../utils/helpers';
 
 export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, t = {} }) {
   const [stream, setStream] = useState(null);
   const [facingMode, setFacingMode] = useState('environment'); // 'environment' or 'user'
   const [capturedDataUrl, setCapturedDataUrl] = useState(null);
-  const [filter, setFilter] = useState('none'); // Default to Original photo colors as requested
+  const [filter, setFilter] = useState('none'); // Default to Original photo colors
   const [rotation, setRotation] = useState(0); // 0, 90, 180, 270
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState(null);
   const [isAutoDetecting, setIsAutoDetecting] = useState(false);
+  const [scannedCount, setScannedCount] = useState(0);
 
   // Interactive Photo Crop State (0-100% bounds)
   const [cropArea, setCropArea] = useState({ x: 0, y: 0, w: 100, h: 100 });
@@ -22,7 +23,7 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
   const imageContainerRef = useRef(null);
   const startPosRef = useRef({ x: 0, y: 0, crop: { x: 0, y: 0, w: 100, h: 100 } });
 
-  // Start Camera Stream
+  // Start Camera Stream with explicit Mobile Video Playback fixes (playsinline, muted)
   const startCamera = async (mode = facingMode) => {
     setCameraError(null);
     try {
@@ -30,17 +31,31 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
         stream.getTracks().forEach((t) => t.stop());
       }
       const newStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: mode, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: {
+          facingMode: { ideal: mode },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
         audio: false,
       });
+
       setStream(newStream);
       setIsCameraActive(true);
+
       if (videoRef.current) {
-        videoRef.current.srcObject = newStream;
+        const video = videoRef.current;
+        video.srcObject = newStream;
+        video.setAttribute('playsinline', 'true');
+        video.setAttribute('webkit-playsinline', 'true');
+        video.setAttribute('muted', 'true');
+        video.muted = true;
+        video.onloadedmetadata = () => {
+          video.play().catch((err) => console.warn('Video play error:', err));
+        };
       }
     } catch (err) {
       console.warn('Camera Access Error:', err);
-      setCameraError('Unable to access camera. You can still upload a photo below.');
+      setCameraError('Unable to access camera on mobile device. You can still upload photos below.');
       setIsCameraActive(false);
     }
   };
@@ -63,21 +78,55 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
     setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'));
   };
 
-  // Run AI Auto Edge Detection on Canvas
-  const runAutoDetectCrop = async (sourceCanvas) => {
-    setIsAutoDetecting(true);
+  // Process and Auto-Crop Canvas, then add directly to PDF queue
+  const processAndAddCroppedPhoto = async (sourceCanvas) => {
     try {
+      setIsAutoDetecting(true);
       const bounds = await detectDocumentCropBounds(sourceCanvas);
-      setCropArea(bounds);
+
+      const cropX = Math.round((bounds.x / 100) * sourceCanvas.width);
+      const cropY = Math.round((bounds.y / 100) * sourceCanvas.height);
+      const cropW = Math.max(50, Math.round((bounds.w / 100) * sourceCanvas.width));
+      const cropH = Math.max(50, Math.round((bounds.h / 100) * sourceCanvas.height));
+
+      const croppedCanvas = document.createElement('canvas');
+      croppedCanvas.width = cropW;
+      croppedCanvas.height = cropH;
+      const croppedCtx = croppedCanvas.getContext('2d');
+      croppedCtx.drawImage(sourceCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+
+      if (filter !== 'none') {
+        applyScanFilterToCanvas(croppedCtx, cropW, cropH, filter);
+      }
+
+      croppedCanvas.toBlob(
+        (blob) => {
+          if (!blob) return;
+          const fileName = `scanned_photo_${Date.now()}_${scannedCount + 1}.jpg`;
+          const fileObj = new File([blob], fileName, { type: 'image/jpeg' });
+          const previewUrl = URL.createObjectURL(blob);
+
+          onAddPhoto({
+            id: `scan-${Date.now()}-${scannedCount}`,
+            file: fileObj,
+            name: fileName,
+            size: blob.size,
+            preview: previewUrl,
+          });
+
+          setScannedCount((c) => c + 1);
+        },
+        'image/jpeg',
+        0.88
+      );
     } catch (e) {
-      console.warn('Auto crop error:', e);
-      setCropArea({ x: 0, y: 0, w: 100, h: 100 });
+      console.warn('Auto process error:', e);
     } finally {
       setIsAutoDetecting(false);
     }
   };
 
-  // Capture Snapshot from Video Stream
+  // Capture Snapshot & Instant CamScanner Auto-Crop
   const handleCapture = async () => {
     if (!videoRef.current) return;
     const video = videoRef.current;
@@ -90,34 +139,37 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
     const ctx = canvas.getContext('2d');
     ctx.drawImage(video, 0, 0, width, height);
 
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
-    setCapturedDataUrl(dataUrl);
-    stopCamera();
-
-    // Auto AI Document Crop
-    await runAutoDetectCrop(canvas);
+    // Auto Crop & Add directly to PDF queue
+    await processAndAddCroppedPhoto(canvas);
   };
 
-  // Handle Photo File Upload
-  const handleFileUpload = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (evt) => {
-      const dataUrl = evt.target?.result;
-      setCapturedDataUrl(dataUrl);
-      stopCamera();
+  // Handle Photo File Upload (Multiple or Single)
+  const handleFileUpload = async (e) => {
+    const selectedFiles = Array.from(e.target.files || []);
+    if (selectedFiles.length === 0) return;
 
+    for (let i = 0; i < selectedFiles.length; i++) {
+      const file = selectedFiles[i];
       const img = new Image();
-      img.onload = async () => {
-        await runAutoDetectCrop(img);
-      };
-      img.src = dataUrl;
-    };
-    reader.readAsDataURL(file);
+      const objUrl = URL.createObjectURL(file);
+      await new Promise((res) => {
+        img.onload = async () => {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+
+          await processAndAddCroppedPhoto(canvas);
+          URL.revokeObjectURL(objUrl);
+          res();
+        };
+        img.src = objUrl;
+      });
+    }
   };
 
-  // Render Filtered Canvas Preview
+  // Render Preview Canvas for manual inspection if needed
   useEffect(() => {
     if (!capturedDataUrl || !canvasRef.current) return;
 
@@ -128,7 +180,6 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
       let w = img.naturalWidth || img.width;
       let h = img.naturalHeight || img.height;
 
-      // Handle canvas dimensions according to rotation
       if (rotation === 90 || rotation === 270) {
         canvas.width = h;
         canvas.height = w;
@@ -154,7 +205,6 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
       ctx.drawImage(img, 0, 0, w, h);
       ctx.restore();
 
-      // Apply selected scan filter algorithm
       if (filter !== 'none') {
         applyScanFilterToCanvas(ctx, canvas.width, canvas.height, filter);
       }
@@ -162,7 +212,7 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
     img.src = capturedDataUrl;
   }, [capturedDataUrl, filter, rotation]);
 
-  // Direct On-Image Drag Corner Logic (No Bottom Sliders)
+  // Direct On-Image Drag Corner Logic
   const handleDragStart = (e, handle) => {
     e.preventDefault();
     e.stopPropagation();
@@ -231,7 +281,6 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
     setDragHandle(null);
   };
 
-  // Add event listeners for dragging
   useEffect(() => {
     if (dragHandle) {
       window.addEventListener('mousemove', handleDragMove);
@@ -247,55 +296,6 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
     };
   }, [dragHandle]);
 
-  // Save / Add Scanned & Cropped Photo to Queue
-  const handleAddScannedPhoto = () => {
-    if (!canvasRef.current && !capturedDataUrl) return;
-
-    const fullCanvas = canvasRef.current;
-    if (!fullCanvas) return;
-
-    let targetCanvas = fullCanvas;
-
-    // Apply Crop if cropped area < 100%
-    if (cropArea.w < 100 || cropArea.h < 100 || cropArea.x > 0 || cropArea.y > 0) {
-      const cropX = Math.round((cropArea.x / 100) * fullCanvas.width);
-      const cropY = Math.round((cropArea.y / 100) * fullCanvas.height);
-      const cropW = Math.max(50, Math.round((cropArea.w / 100) * fullCanvas.width));
-      const cropH = Math.max(50, Math.round((cropArea.h / 100) * fullCanvas.height));
-
-      const croppedCanvas = document.createElement('canvas');
-      croppedCanvas.width = cropW;
-      croppedCanvas.height = cropH;
-      const croppedCtx = croppedCanvas.getContext('2d');
-      croppedCtx.drawImage(fullCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
-      targetCanvas = croppedCanvas;
-    }
-
-    targetCanvas.toBlob(
-      (blob) => {
-        if (!blob) return;
-        const fileName = `scanned_photo_${Date.now()}.jpg`;
-        const fileObj = new File([blob], fileName, { type: 'image/jpeg' });
-        const previewUrl = URL.createObjectURL(blob);
-
-        onAddPhoto({
-          id: `scan-${Date.now()}`,
-          file: fileObj,
-          name: fileName,
-          size: blob.size,
-          preview: previewUrl,
-        });
-
-        // Reset to capture another
-        setCapturedDataUrl(null);
-        setCropArea({ x: 0, y: 0, w: 100, h: 100 });
-        startCamera();
-      },
-      'image/jpeg',
-      0.88
-    );
-  };
-
   const modalBg = isDarkMode ? 'bg-slate-900 border-indigo-500/30 text-white' : 'bg-white border-slate-200 text-slate-900 shadow-2xl';
 
   return (
@@ -310,26 +310,41 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
             </div>
             <div>
               <h3 className="font-extrabold text-base sm:text-lg flex items-center gap-2">
-                <span>{t.scannerTitle || 'Photo Scanner & AI Auto-Crop'}</span>
+                <span>{t.scannerTitle || 'Mobile Photo Scanner & AI Auto-Crop'}</span>
                 <Sparkles className="w-4 h-4 text-amber-500 animate-pulse" />
               </h3>
               <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                {t.scannerDesc || 'Capture photos, AI auto-detects edges, or drag corner handles directly on the image'}
+                Snap or upload photos — AI automatically crops document paper & builds your PDF
               </p>
             </div>
           </div>
 
-          <button
-            onClick={() => {
-              stopCamera();
-              onClose();
-            }}
-            className={`p-2 rounded-xl border transition-colors ${
-              isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white' : 'bg-slate-100 border-slate-200 text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            {scannedCount > 0 && (
+              <button
+                onClick={() => {
+                  stopCamera();
+                  onClose();
+                }}
+                className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1 shadow-md"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Finish ({scannedCount} photos)</span>
+              </button>
+            )}
+
+            <button
+              onClick={() => {
+                stopCamera();
+                onClose();
+              }}
+              className={`p-2 rounded-xl border transition-colors ${
+                isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white' : 'bg-slate-100 border-slate-200 text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Modal Main Viewport */}
@@ -337,39 +352,41 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
           {!capturedDataUrl ? (
             /* Live Camera Feed View */
             <div className="w-full max-w-lg flex flex-col items-center gap-4">
+              
+              {/* Scanned Badge Counter */}
+              {scannedCount > 0 && (
+                <div className="px-4 py-1.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 text-xs font-bold flex items-center gap-1.5 animate-bounce">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>{scannedCount} scanned document photo(s) added to PDF queue!</span>
+                </div>
+              )}
+
               <div className="relative w-full aspect-[4/3] bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 flex items-center justify-center shadow-inner">
                 {isCameraActive ? (
                   <video
                     ref={videoRef}
                     autoPlay
                     playsInline
+                    webkit-playsinline="true"
+                    muted
                     className="w-full h-full object-cover"
                   />
                 ) : (
                   <div className="text-center p-6">
                     <Camera className="w-12 h-12 text-slate-600 mx-auto mb-2" />
                     <p className="text-xs text-slate-400 max-w-xs mx-auto">
-                      {cameraError || 'Camera stream offline.'}
+                      {cameraError || 'Camera stream initializing...'}
                     </p>
-                  </div>
-                )}
-
-                {/* Target Overlay Scanner Frame */}
-                {isCameraActive && (
-                  <div className="absolute inset-6 border-2 border-dashed border-indigo-400/60 rounded-xl pointer-events-none flex items-center justify-center">
-                    <span className="text-[11px] font-semibold text-indigo-300 bg-slate-950/80 px-3 py-1 rounded-full border border-indigo-500/40">
-                      {t.alignPhoto || 'Align photo inside frame'}
-                    </span>
                   </div>
                 )}
               </div>
 
-              {/* Camera Controls */}
-              <div className="flex items-center gap-4">
+              {/* Camera Action Controls */}
+              <div className="flex items-center justify-center gap-6 w-full pt-2">
                 {isCameraActive && (
                   <button
                     onClick={toggleFacingMode}
-                    className="p-3 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 shadow-md"
+                    className="p-3.5 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 shadow-md"
                     title="Switch Camera"
                   >
                     <RefreshCw className="w-5 h-5" />
@@ -379,17 +396,20 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
                 {isCameraActive && (
                   <button
                     onClick={handleCapture}
-                    className="w-16 h-16 rounded-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:scale-105 active:scale-95 shadow-xl shadow-indigo-500/40 flex items-center justify-center border-4 border-white/20 transition-transform"
-                    title="Take Photo"
+                    disabled={isAutoDetecting}
+                    className="w-18 h-18 rounded-full bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:scale-105 active:scale-95 shadow-2xl shadow-indigo-500/50 flex items-center justify-center border-4 border-white transition-transform"
+                    title="Snap Document Photo"
                   >
-                    <div className="w-8 h-8 rounded-full bg-white" />
+                    <div className="w-8 h-8 rounded-full bg-white flex items-center justify-center">
+                      {isAutoDetecting && <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />}
+                    </div>
                   </button>
                 )}
 
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  className="p-3 rounded-full bg-slate-800 hover:bg-slate-700 text-indigo-400 hover:text-indigo-300 border border-slate-700 flex items-center justify-center shadow-md"
-                  title="Upload Photo"
+                  className="p-3.5 rounded-full bg-slate-800 hover:bg-slate-700 text-indigo-400 hover:text-indigo-300 border border-slate-700 flex items-center justify-center shadow-md"
+                  title="Upload Photos from Gallery"
                 >
                   <ImageIcon className="w-5 h-5" />
                 </button>
@@ -397,27 +417,29 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
                   ref={fileInputRef}
                   type="file"
                   accept="image/*"
+                  multiple
                   onChange={handleFileUpload}
                   className="hidden"
                 />
               </div>
+
+              <p className="text-[11px] text-slate-400 text-center font-medium">
+                Tap photo button to snap & AI auto-crops paper directly into PDF!
+              </p>
             </div>
           ) : (
-            /* Filter & On-Image Corner Drag Crop Preview */
+            /* Manual Inspection & Adjustment View if Triggered */
             <div className="w-full max-w-xl flex flex-col items-center gap-4">
-              
-              {/* Image Preview Canvas with DIRECT Interactive Corner Handles */}
               <div
                 ref={imageContainerRef}
                 className="relative max-h-[380px] max-w-full overflow-hidden rounded-2xl border border-slate-700 bg-slate-950 flex items-center justify-center shadow-2xl select-none"
               >
                 <canvas ref={canvasRef} className="max-h-[380px] max-w-full object-contain pointer-events-none" />
 
-                {/* Direct On-Image Corner & Edge Drag Overlay (NO SLIDERS) */}
                 <div
                   onMouseDown={(e) => handleDragStart(e, 'move')}
                   onTouchStart={(e) => handleDragStart(e, 'move')}
-                  className="absolute border-2 border-indigo-400 bg-indigo-500/15 rounded-lg cursor-grab active:cursor-grabbing shadow-xl transition-shadow"
+                  className="absolute border-2 border-indigo-400 bg-indigo-500/15 rounded-lg cursor-grab active:cursor-grabbing shadow-2xl"
                   style={{
                     left: `${cropArea.x}%`,
                     top: `${cropArea.y}%`,
@@ -425,131 +447,31 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
                     height: `${cropArea.h}%`,
                   }}
                 >
-                  {/* Badge */}
                   <span className="absolute top-1.5 left-1.5 px-2 py-0.5 rounded bg-indigo-600 text-white font-mono text-[9px] font-bold pointer-events-none flex items-center gap-1 shadow-sm">
-                    <Crop className="w-3 h-3" /> Auto-Crop
+                    <Crop className="w-3 h-3" /> Auto Crop
                   </span>
 
-                  {/* Corner Handle Dots directly ON TOP of the picture */}
-                  <div
-                    onMouseDown={(e) => handleDragStart(e, 'nw')}
-                    onTouchStart={(e) => handleDragStart(e, 'nw')}
-                    className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -top-2.5 -left-2.5 cursor-nwse-resize touch-none shadow-lg hover:scale-125 transition-transform"
-                  />
-                  <div
-                    onMouseDown={(e) => handleDragStart(e, 'ne')}
-                    onTouchStart={(e) => handleDragStart(e, 'ne')}
-                    className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -top-2.5 -right-2.5 cursor-nesw-resize touch-none shadow-lg hover:scale-125 transition-transform"
-                  />
-                  <div
-                    onMouseDown={(e) => handleDragStart(e, 'sw')}
-                    onTouchStart={(e) => handleDragStart(e, 'sw')}
-                    className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -bottom-2.5 -left-2.5 cursor-nesw-resize touch-none shadow-lg hover:scale-125 transition-transform"
-                  />
-                  <div
-                    onMouseDown={(e) => handleDragStart(e, 'se')}
-                    onTouchStart={(e) => handleDragStart(e, 'se')}
-                    className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -bottom-2.5 -right-2.5 cursor-nwse-resize touch-none shadow-lg hover:scale-125 transition-transform"
-                  />
+                  <div onMouseDown={(e) => handleDragStart(e, 'nw')} onTouchStart={(e) => handleDragStart(e, 'nw')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -top-2.5 -left-2.5 cursor-nwse-resize touch-none shadow-lg" />
+                  <div onMouseDown={(e) => handleDragStart(e, 'ne')} onTouchStart={(e) => handleDragStart(e, 'ne')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -top-2.5 -right-2.5 cursor-nesw-resize touch-none shadow-lg" />
+                  <div onMouseDown={(e) => handleDragStart(e, 'sw')} onTouchStart={(e) => handleDragStart(e, 'sw')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -bottom-2.5 -left-2.5 cursor-nesw-resize touch-none shadow-lg" />
+                  <div onMouseDown={(e) => handleDragStart(e, 'se')} onTouchStart={(e) => handleDragStart(e, 'se')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -bottom-2.5 -right-2.5 cursor-nwse-resize touch-none shadow-lg" />
                 </div>
               </div>
 
-              {/* Quick Presets Bar */}
-              <div className={`w-full border rounded-2xl p-3 flex flex-wrap items-center justify-between gap-2 ${
-                isDarkMode ? 'bg-slate-950/80 border-slate-800' : 'bg-slate-50 border-slate-200'
-              }`}>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => runAutoDetectCrop(canvasRef.current)}
-                    className="px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center gap-1 shadow-md"
-                    title="Run AI Edge Auto-Detect"
-                  >
-                    <Sparkles className="w-3.5 h-3.5" /> AI Auto Detect
-                  </button>
-
-                  <button
-                    onClick={() => setCropArea({ x: 0, y: 0, w: 100, h: 100 })}
-                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-400 text-xs font-semibold flex items-center gap-1 border border-slate-700"
-                    title="100% Full Photo"
-                  >
-                    <Maximize className="w-3.5 h-3.5" /> {t.entirePhoto || 'Entire Photo (100%)'}
-                  </button>
-
-                  <button
-                    onClick={() => setCropArea({ x: 4, y: 4, w: 92, h: 92 })}
-                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-amber-400 text-xs font-semibold flex items-center gap-1 border border-slate-700"
-                    title="Trim Border Margins"
-                  >
-                    <Scissors className="w-3.5 h-3.5" /> {t.trimMargins || 'Trim Margins'}
-                  </button>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setRotation((prev) => (prev + 90) % 360)}
-                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1"
-                  >
-                    <RotateCw className="w-3.5 h-3.5 text-indigo-400" /> {t.rotate || 'Rotate'}
-                  </button>
-                </div>
-              </div>
-
-              {/* Scan Filter Options */}
-              <div className={`w-full border rounded-2xl p-3.5 space-y-2 ${
-                isDarkMode ? 'bg-slate-950/80 border-slate-800' : 'bg-slate-50 border-slate-200'
-              }`}>
-                <div className="text-xs font-bold flex items-center gap-1.5 text-indigo-500">
-                  <Wand2 className="w-4 h-4" /> Document Scan Effect:
-                </div>
-
-                <div className="grid grid-cols-4 gap-2">
-                  {[
-                    { id: 'bw', name: 'B&W Scan', desc: 'Crisp Document' },
-                    { id: 'grayscale', name: 'Grayscale', desc: 'Clean Gray' },
-                    { id: 'magic', name: 'Magic Color', desc: 'Enhanced' },
-                    { id: 'none', name: 'Original', desc: 'No Filter' },
-                  ].map((f) => (
-                    <button
-                      key={f.id}
-                      onClick={() => setFilter(f.id)}
-                      className={`p-2 rounded-xl text-center border transition-all ${
-                        filter === f.id
-                          ? 'bg-indigo-600/30 border-indigo-500 text-indigo-500 font-bold ring-1 ring-indigo-500'
-                          : isDarkMode ? 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'
-                      }`}
-                    >
-                      <div className="text-xs font-semibold">{f.name}</div>
-                      <div className="text-[10px] opacity-75">{f.desc}</div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Action Buttons */}
               <div className="flex items-center gap-3 w-full">
                 <button
                   onClick={() => {
                     setCapturedDataUrl(null);
-                    setCropArea({ x: 0, y: 0, w: 100, h: 100 });
                     startCamera();
                   }}
-                  className={`flex-1 py-3 px-4 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 transition-colors ${
-                    isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white' : 'bg-slate-100 border-slate-300 text-slate-700 hover:text-slate-900'
+                  className={`flex-1 py-3 px-4 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 ${
+                    isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-slate-100 border-slate-300 text-slate-700'
                   }`}
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
-                  <span>{t.retake || 'Retake / Upload Another'}</span>
-                </button>
-
-                <button
-                  onClick={handleAddScannedPhoto}
-                  className="flex-1 py-3.5 px-4 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-bold text-xs shadow-lg shadow-indigo-500/25 flex items-center justify-center gap-1.5"
-                >
-                  <Check className="w-4 h-4" />
-                  <span>{t.addPhotoToQueue || 'Add Scanned Photo to PDF Queue'}</span>
+                  <span>Snap Another</span>
                 </button>
               </div>
-
             </div>
           )}
         </div>
