@@ -1,9 +1,11 @@
 import * as pdfjsLib from 'pdfjs-dist/build/pdf.mjs';
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import JSZip from 'jszip';
 import { readAsArrayBuffer } from './helpers';
 
-// Worker setup
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version || '4.10.38'}/pdf.worker.min.mjs`;
+// Local worker setup for 100% offline usage
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+
 
 /**
  * Render PDF pages into individual image files or a ZIP archive

@@ -1,9 +1,11 @@
 import * as pdfjsLib from 'pdfjs-dist/build/pdf.mjs';
+import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { Document, Packer, Paragraph, TextRun, ImageRun, HeadingLevel } from 'docx';
 import { readAsArrayBuffer } from './helpers';
 
-// Configure pdfjs worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version || '4.10.38'}/pdf.worker.min.mjs`;
+// Configure pdfjs worker locally for 100% offline usage
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+
 
 /**
  * Convert a PDF file to a Microsoft Word (.docx) blob

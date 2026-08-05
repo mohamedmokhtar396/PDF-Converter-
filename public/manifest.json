@@ -1,0 +1,10 @@
+{
+  "short_name": "PDF Converter",
+  "name": "PDF Converter & Photo Scanner Pro",
+  "icons": [],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#090d16",
+  "background_color": "#090d16",
+  "description": "100% Offline Client-Side PDF Converter, Photo Scanner & PDF Cropper"
+}
