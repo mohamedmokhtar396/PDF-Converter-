@@ -7,6 +7,12 @@ export const translations = {
     heroTitle: 'All-in-One Document & Image Converter',
     heroSubtitle: 'Transform your files seamlessly in seconds. Drag and drop, preview, customize options, rename & download.',
     
+    // Category Section Headers
+    scannerSectionTitle: '📷 Document Scanner & AI Crop Suite',
+    scannerSectionDesc: 'Scan paper documents, auto-crop margins, filter scans & process PDF pages',
+    converterSectionTitle: '📄 File Format Converters',
+    converterSectionDesc: 'Convert between PDF, Word, Images, and extract content in seconds',
+
     // Modes
     modes: {
       imageToPdf: { title: 'Images to PDF', subtitle: 'JPG, PNG, WEBP → PDF', badge: 'Popular' },
@@ -101,6 +107,12 @@ export const translations = {
     heroTitle: 'المحول الشامل للمستندات والماسح الضوئي للصور',
     heroSubtitle: 'حول ملفاتك بسهولة في ثوانٍ. اسحب وأفلت، عاين، خصص خيارات الضغط والماسح، أعد التسمية وحمّل مباشرة.',
     
+    // Category Section Headers
+    scannerSectionTitle: '📷 قسم الماسح الضوئي والذكاء الاصطناعي (AI Scanner & Crop)',
+    scannerSectionDesc: 'مسح المستندات الورقية ضوئياً، قص الحواف تلقائياً، وتنسيق صفحات PDF',
+    converterSectionTitle: '📄 قسم تحويل المستندات والملفات (File Converters)',
+    converterSectionDesc: 'تحويل الملفات بين PDF و Word والصور بسرعة ودقة عالية',
+
     // Modes
     modes: {
       imageToPdf: { title: 'صور إلى PDF', subtitle: 'دمج الصور JPG, PNG → ملف PDF', badge: 'الشائع' },
