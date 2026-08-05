@@ -178,102 +178,119 @@ export function sanitizeFileName(name, defaultExt = '') {
 }
 
 /**
- * Auto-detect document edges / non-blank content boundaries for AI Auto-Crop (0-100%)
+ * Ultra-High Precision AI Document Paper Edge Detection (0-100%)
+ * Automatically locates paper sheet boundaries vs desk/background
  * @param {HTMLCanvasElement | HTMLImageElement} source
  * @returns {Promise<{x: number, y: number, w: number, h: number}>} Crop percentages (0..100)
  */
 export async function detectDocumentCropBounds(source) {
   return new Promise((resolve) => {
     try {
-      const sampleWidth = 320;
+      const sampleW = 320;
       let imgW = source.width || source.naturalWidth || 800;
       let imgH = source.height || source.naturalHeight || 600;
-      const sampleHeight = Math.round((imgH * sampleWidth) / imgW);
+      const sampleH = Math.round((imgH * sampleW) / imgW);
 
       const canvas = document.createElement('canvas');
-      canvas.width = sampleWidth;
-      canvas.height = sampleHeight;
+      canvas.width = sampleW;
+      canvas.height = sampleH;
       const ctx = canvas.getContext('2d');
-      ctx.drawImage(source, 0, 0, sampleWidth, sampleHeight);
+      ctx.drawImage(source, 0, 0, sampleW, sampleH);
 
-      const imageData = ctx.getImageData(0, 0, sampleWidth, sampleHeight);
+      const imageData = ctx.getImageData(0, 0, sampleW, sampleH);
       const data = imageData.data;
 
-      // Sample corner pixels to estimate background color (desk or page border)
-      const cornerSamples = [
-        [0, 0],
-        [sampleWidth - 1, 0],
-        [0, sampleHeight - 1],
-        [sampleWidth - 1, sampleHeight - 1],
-      ];
+      const getPixelLum = (x, y) => {
+        const idx = (y * sampleW + x) * 4;
+        return 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+      };
 
-      let bgR = 0, bgG = 0, bgB = 0;
-      cornerSamples.forEach(([cx, cy]) => {
-        const idx = (cy * sampleWidth + cx) * 4;
-        bgR += data[idx];
-        bgG += data[idx + 1];
-        bgB += data[idx + 2];
-      });
-      bgR = Math.round(bgR / 4);
-      bgG = Math.round(bgG / 4);
-      bgB = Math.round(bgB / 4);
+      // Sample outer border luminance (outer 4% frame)
+      let borderLumSum = 0;
+      let count = 0;
+      for (let x = 0; x < sampleW; x += 4) {
+        borderLumSum += getPixelLum(x, 2) + getPixelLum(x, sampleH - 3);
+        count += 2;
+      }
+      for (let y = 0; y < sampleH; y += 4) {
+        borderLumSum += getPixelLum(2, y) + getPixelLum(sampleW - 3, y);
+        count += 2;
+      }
+      const borderLum = borderLumSum / Math.max(1, count);
 
-      let minX = sampleWidth, minY = sampleHeight, maxX = 0, maxY = 0;
-      let detectedCount = 0;
-
-      for (let y = 0; y < sampleHeight; y++) {
-        for (let x = 0; x < sampleWidth; x++) {
-          const idx = (y * sampleWidth + x) * 4;
-          const r = data[idx];
-          const g = data[idx + 1];
-          const b = data[idx + 2];
-
-          // Calculate color difference from background
-          const diff = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
-          
-          // Also check luminance contrast from white/dark borders
-          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-
-          if (diff > 35 || lum < 220) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            detectedCount++;
-          }
+      // 1. Find Top Edge (Top -> Down scan)
+      let topY = 0;
+      for (let y = 0; y < Math.round(sampleH * 0.45); y++) {
+        let matchCount = 0;
+        for (let x = Math.round(sampleW * 0.15); x < Math.round(sampleW * 0.85); x += 2) {
+          const lum = getPixelLum(x, y);
+          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
+        }
+        if (matchCount > Math.round(sampleW * 0.25)) {
+          topY = y;
+          break;
         }
       }
 
-      // If document edge detected cleanly
-      if (detectedCount > 100 && maxX > minX && maxY > minY) {
-        // Add 1.5% padding margin
-        const padX = Math.round(sampleWidth * 0.015);
-        const padY = Math.round(sampleHeight * 0.015);
-
-        const cropX = Math.max(0, minX - padX);
-        const cropY = Math.max(0, minY - padY);
-        const cropW = Math.min(sampleWidth - cropX, (maxX - minX) + (padX * 2));
-        const cropH = Math.min(sampleHeight - cropY, (maxY - minY) + (padY * 2));
-
-        const pctX = Math.round((cropX / sampleWidth) * 100);
-        const pctY = Math.round((cropY / sampleHeight) * 100);
-        const pctW = Math.round((cropW / sampleWidth) * 100);
-        const pctH = Math.round((cropH / sampleHeight) * 100);
-
-        // Ensure minimum 20% size
-        if (pctW >= 20 && pctH >= 20) {
-          resolve({ x: pctX, y: pctY, w: Math.min(100 - pctX, pctW), h: Math.min(100 - pctY, pctH) });
-          return;
+      // 2. Find Bottom Edge (Bottom -> Up scan)
+      let bottomY = sampleH - 1;
+      for (let y = sampleH - 1; y > Math.round(sampleH * 0.55); y--) {
+        let matchCount = 0;
+        for (let x = Math.round(sampleW * 0.15); x < Math.round(sampleW * 0.85); x += 2) {
+          const lum = getPixelLum(x, y);
+          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
+        }
+        if (matchCount > Math.round(sampleW * 0.25)) {
+          bottomY = y;
+          break;
         }
       }
 
-      // Default fallback: 100% full content
-      resolve({ x: 0, y: 0, w: 100, h: 100 });
+      // 3. Find Left Edge (Left -> Right scan)
+      let leftX = 0;
+      for (let x = 0; x < Math.round(sampleW * 0.45); x++) {
+        let matchCount = 0;
+        for (let y = Math.round(sampleH * 0.15); y < Math.round(sampleH * 0.85); y += 2) {
+          const lum = getPixelLum(x, y);
+          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
+        }
+        if (matchCount > Math.round(sampleH * 0.25)) {
+          leftX = x;
+          break;
+        }
+      }
+
+      // 4. Find Right Edge (Right -> Left scan)
+      let rightX = sampleW - 1;
+      for (let x = sampleW - 1; x > Math.round(sampleW * 0.55); x--) {
+        let matchCount = 0;
+        for (let y = Math.round(sampleH * 0.15); y < Math.round(sampleH * 0.85); y += 2) {
+          const lum = getPixelLum(x, y);
+          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
+        }
+        if (matchCount > Math.round(sampleH * 0.25)) {
+          rightX = x;
+          break;
+        }
+      }
+
+      let pctX = Math.round((leftX / sampleW) * 100);
+      let pctY = Math.round((topY / sampleH) * 100);
+      let pctW = Math.round(((rightX - leftX) / sampleW) * 100);
+      let pctH = Math.round(((bottomY - topY) / sampleH) * 100);
+
+      pctX = Math.max(0, pctX);
+      pctY = Math.max(0, pctY);
+      pctW = Math.min(100 - pctX, Math.max(30, pctW));
+      pctH = Math.min(100 - pctY, Math.max(30, pctH));
+
+      resolve({ x: pctX, y: pctY, w: pctW, h: pctH });
     } catch (e) {
-      console.warn('Auto-crop detection error:', e);
+      console.warn('AI Crop Detection error:', e);
       resolve({ x: 0, y: 0, w: 100, h: 100 });
     }
   });
 }
+
 
 

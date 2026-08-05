@@ -17,7 +17,7 @@ export default function PdfScannerCrop({ pdfFile, onComplete, onCancel, isDarkMo
   const [pdfDoc, setPdfDoc] = useState(null);
 
   // Active page editing state
-  const [activeFilter, setActiveFilter] = useState('bw');
+  const [activeFilter, setActiveFilter] = useState('none'); // Default to Original photo colors
   const [cropArea, setCropArea] = useState({ x: 0, y: 0, w: 100, h: 100 });
   const [dragHandle, setDragHandle] = useState(null);
 
@@ -55,12 +55,12 @@ export default function PdfScannerCrop({ pdfFile, onComplete, onCancel, isDarkMo
 
             const autoBounds = await detectDocumentCropBounds(sampleCanvas);
             configs.push({
-              filter: 'bw',
+              filter: 'none',
               rotation: 0,
               crop: autoBounds,
             });
           } catch (e) {
-            configs.push({ filter: 'bw', rotation: 0, crop: { x: 0, y: 0, w: 100, h: 100 } });
+            configs.push({ filter: 'none', rotation: 0, crop: { x: 0, y: 0, w: 100, h: 100 } });
           }
         }
 
