@@ -178,17 +178,24 @@ export function sanitizeFileName(name, defaultExt = '') {
 }
 
 /**
- * Multi-Stage AI Sobel Edge & Document Margin Auto-Crop Detector (0-100%)
- * Uses Sobel Gradient Magnitude to locate text, table edges, paper bounds, and stamps
+ * Dual-Mode AI Document Crop Detector (0-100%)
+ *
+ * MODE A — Dark Background (photo of paper on desk/car seat):
+ *   Uses Otsu's adaptive thresholding to find the bright white paper
+ *   region within the dark surrounding background.
+ *
+ * MODE B — White/Light Background (digital PDF page):
+ *   Scans row/column content density to find where text/lines begin and end.
+ *
  * @param {HTMLCanvasElement | HTMLImageElement} source
- * @returns {Promise<{x: number, y: number, w: number, h: number}>} Crop percentages (0..100)
+ * @returns {Promise<{x: number, y: number, w: number, h: number}>}
  */
 export async function detectDocumentCropBounds(source) {
   return new Promise((resolve) => {
     try {
       const sampleW = 320;
-      let imgW = source.width || source.naturalWidth || 800;
-      let imgH = source.height || source.naturalHeight || 600;
+      const imgW = source.width || source.naturalWidth || 800;
+      const imgH = source.height || source.naturalHeight || 600;
       const sampleH = Math.round((imgH * sampleW) / imgW);
 
       const canvas = document.createElement('canvas');
@@ -197,77 +204,137 @@ export async function detectDocumentCropBounds(source) {
       const ctx = canvas.getContext('2d');
       ctx.drawImage(source, 0, 0, sampleW, sampleH);
 
-      const imageData = ctx.getImageData(0, 0, sampleW, sampleH);
-      const data = imageData.data;
+      const { data } = ctx.getImageData(0, 0, sampleW, sampleH);
 
-      // Convert to luminance map
-      const lumMap = new Float32Array(sampleW * sampleH);
+      // Build Uint8 luminance map
+      const lum = new Uint8Array(sampleW * sampleH);
       for (let i = 0; i < data.length; i += 4) {
-        lumMap[i / 4] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        lum[i / 4] = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
       }
 
-      const getLum = (x, y) => lumMap[y * sampleW + x];
-
-      // Sobel Gradient Edge Detection
-      let minX = sampleW, minY = sampleH, maxX = 0, maxY = 0;
-      let edgePixelCount = 0;
-
-      for (let y = 1; y < sampleH - 1; y++) {
-        for (let x = 1; x < sampleW - 1; x++) {
-          // Horizontal Sobel gx
-          const gx =
-            -getLum(x - 1, y - 1) + getLum(x + 1, y - 1) +
-            -2 * getLum(x - 1, y) + 2 * getLum(x + 1, y) +
-            -getLum(x - 1, y + 1) + getLum(x + 1, y + 1);
-
-          // Vertical Sobel gy
-          const gy =
-            -getLum(x - 1, y - 1) - 2 * getLum(x, y - 1) - getLum(x + 1, y - 1) +
-             getLum(x - 1, y + 1) + 2 * getLum(x, y + 1) + getLum(x + 1, y + 1);
-
-          const mag = Math.abs(gx) + Math.abs(gy);
-
-          // If edge or text/table/stamp feature
-          if (mag > 35) {
-            if (x < minX) minX = x;
-            if (x > maxX) maxX = x;
-            if (y < minY) minY = y;
-            if (y > maxY) maxY = y;
-            edgePixelCount++;
-          }
+      // ── Sample corner brightness to choose detection mode ──────────────────
+      const cs = Math.round(sampleW * 0.1); // corner sample size = 10%
+      let cSum = 0, cCnt = 0;
+      for (let cy = 0; cy < cs; cy++) {
+        for (let cx = 0; cx < cs; cx++) {
+          cSum += lum[cy * sampleW + cx];                                   // top-left
+          cSum += lum[cy * sampleW + (sampleW - 1 - cx)];                  // top-right
+          cSum += lum[(sampleH - 1 - cy) * sampleW + cx];                  // bottom-left
+          cSum += lum[(sampleH - 1 - cy) * sampleW + (sampleW - 1 - cx)]; // bottom-right
+          cCnt += 4;
         }
       }
+      const cornerAvg = cSum / cCnt;
 
-      // If document edges or text/table features detected
-      if (edgePixelCount > 30 && maxX > minX && maxY > minY) {
-        // Add 2% padding around content
-        const padX = Math.round(sampleW * 0.02);
-        const padY = Math.round(sampleH * 0.02);
+      let minX = sampleW, minY = sampleH, maxX = 0, maxY = 0;
+      let found = 0;
 
-        const cropX = Math.max(0, minX - padX);
-        const cropY = Math.max(0, minY - padY);
-        const cropW = Math.min(sampleW - cropX, (maxX - minX) + (padX * 2));
-        const cropH = Math.min(sampleH - cropY, (maxY - minY) + (padY * 2));
+      if (cornerAvg < 130) {
+        // ═══ MODE A: Dark background — find bright white paper ════════════════
+        // Otsu's thresholding: pick the luminance value that maximises
+        // between-class variance (paper vs background).
+        const hist = new Int32Array(256);
+        for (let i = 0; i < lum.length; i++) hist[lum[i]]++;
 
-        const pctX = Math.round((cropX / sampleW) * 100);
-        const pctY = Math.round((cropY / sampleH) * 100);
-        const pctW = Math.round((cropW / sampleW) * 100);
-        const pctH = Math.round((cropH / sampleH) * 100);
+        const total = lum.length;
+        let sum = 0;
+        for (let t = 0; t < 256; t++) sum += t * hist[t];
 
-        if (pctW >= 25 && pctH >= 25 && (pctX > 0 || pctY > 0 || pctW < 98 || pctH < 98)) {
+        let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+        for (let t = 0; t < 256; t++) {
+          wB += hist[t];
+          if (!wB) continue;
+          const wF = total - wB;
+          if (!wF) break;
+          sumB += t * hist[t];
+          const mB = sumB / wB;
+          const mF = (sum - sumB) / wF;
+          const varB = wB * wF * (mB - mF) ** 2;
+          if (varB > maxVar) { maxVar = varB; threshold = t; }
+        }
+
+        // Clamp threshold: paper is always bright
+        threshold = Math.max(threshold, 140);
+
+        // Bounding box of the bright (paper) region
+        for (let y = 0; y < sampleH; y++) {
+          for (let x = 0; x < sampleW; x++) {
+            if (lum[y * sampleW + x] >= threshold) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+              found++;
+            }
+          }
+        }
+      } else {
+        // ═══ MODE B: White/light background — find text/content region ════════
+        const darkThresh = 210; // pixel darker than this = content
+
+        // Top edge
+        let topY = 0;
+        for (let y = 0; y < sampleH; y++) {
+          let dark = 0;
+          for (let x = 0; x < sampleW; x++) if (lum[y * sampleW + x] < darkThresh) dark++;
+          if (dark > sampleW * 0.015) { topY = y; break; }
+        }
+        // Bottom edge
+        let bottomY = sampleH - 1;
+        for (let y = sampleH - 1; y >= 0; y--) {
+          let dark = 0;
+          for (let x = 0; x < sampleW; x++) if (lum[y * sampleW + x] < darkThresh) dark++;
+          if (dark > sampleW * 0.015) { bottomY = y; break; }
+        }
+        // Left edge
+        let leftX = 0;
+        for (let x = 0; x < sampleW; x++) {
+          let dark = 0;
+          for (let y = 0; y < sampleH; y++) if (lum[y * sampleW + x] < darkThresh) dark++;
+          if (dark > sampleH * 0.015) { leftX = x; break; }
+        }
+        // Right edge
+        let rightX = sampleW - 1;
+        for (let x = sampleW - 1; x >= 0; x--) {
+          let dark = 0;
+          for (let y = 0; y < sampleH; y++) if (lum[y * sampleW + x] < darkThresh) dark++;
+          if (dark > sampleH * 0.015) { rightX = x; break; }
+        }
+
+        minX = leftX; minY = topY; maxX = rightX; maxY = bottomY;
+        found = (maxX - minX) * (maxY - minY);
+      }
+
+      // ── Convert pixel coords → percentage bounds ───────────────────────────
+      if (found > 200 && maxX > minX && maxY > minY) {
+        const padX = Math.round(sampleW * 0.015);
+        const padY = Math.round(sampleH * 0.015);
+
+        const cx = Math.max(0, minX - padX);
+        const cy = Math.max(0, minY - padY);
+        const cw = Math.min(sampleW - cx, (maxX - minX) + padX * 2);
+        const ch = Math.min(sampleH - cy, (maxY - minY) + padY * 2);
+
+        const pctX = Math.round((cx / sampleW) * 100);
+        const pctY = Math.round((cy / sampleH) * 100);
+        const pctW = Math.min(100 - pctX, Math.round((cw / sampleW) * 100));
+        const pctH = Math.min(100 - pctY, Math.round((ch / sampleH) * 100));
+
+        if (pctW >= 20 && pctH >= 20) {
           resolve({ x: pctX, y: pctY, w: pctW, h: pctH });
           return;
         }
       }
 
-      // Default smart document trim (4% margins)
-      resolve({ x: 4, y: 4, w: 92, h: 92 });
+      // Fallback — conservative 3% margins
+      resolve({ x: 3, y: 3, w: 94, h: 94 });
     } catch (e) {
-      console.warn('AI Crop Detection error:', e);
-      resolve({ x: 4, y: 4, w: 92, h: 92 });
+      console.warn('detectDocumentCropBounds error:', e);
+      resolve({ x: 3, y: 3, w: 94, h: 94 });
     }
   });
 }
+
 
 
 

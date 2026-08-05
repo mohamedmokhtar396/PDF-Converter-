@@ -168,86 +168,146 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
   // ─── Real-Time Live Frame Analysis Loop ─────────────────────────────────────
   useEffect(() => {
     if (!isCameraActive) return;
-
     let frameSkip = 0;
-    const SKIP_FRAMES = 6; // Analyse every 6th frame for performance
+    const SKIP = 5; // analyse every 5th frame
 
     const analyzeFrame = () => {
       const video = videoRef.current;
-      const overlayCanvas = overlayCanvasRef.current;
+      const overlay = overlayCanvasRef.current;
 
-      if (video && video.readyState >= 2 && overlayCanvas) {
+      if (video && video.readyState >= 2 && overlay) {
         frameSkip++;
-        if (frameSkip >= SKIP_FRAMES) {
+        if (frameSkip >= SKIP) {
           frameSkip = 0;
 
-          // Draw video frame to temp canvas for analysis
-          const tempCanvas = document.createElement('canvas');
-          tempCanvas.width = video.videoWidth || 640;
-          tempCanvas.height = video.videoHeight || 480;
-          const tempCtx = tempCanvas.getContext('2d');
-          tempCtx.drawImage(video, 0, 0);
+          // Match overlay pixel dimensions to the video element's rendered size
+          const rect = video.getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            overlay.width = rect.width;
+            overlay.height = rect.height;
+          }
 
-          // Detect document bounds in this frame
-          const detection = detectDocumentInFrame(tempCanvas);
+          // Render video frame to offscreen canvas for analysis
+          const vw = video.videoWidth || 640;
+          const vh = video.videoHeight || 480;
+          if (vw > 0 && vh > 0) {
+            const temp = document.createElement('canvas');
+            temp.width = vw;
+            temp.height = vh;
+            temp.getContext('2d').drawImage(video, 0, 0);
 
-          setLiveDetection(detection);
+            // Inline fast Otsu detection on the live frame
+            const sW = 160, sH = Math.round(vh * sW / vw);
+            const sc = document.createElement('canvas');
+            sc.width = sW; sc.height = sH;
+            const sctx = sc.getContext('2d');
+            sctx.drawImage(temp, 0, 0, sW, sH);
+            const { data } = sctx.getImageData(0, 0, sW, sH);
 
-          // Stability check: if same region detected for N frames → auto-ready
-          const last = stabilityRef.current.lastBounds;
-          if (last && detection.confidence > 200) {
-            const diffX = Math.abs(detection.x - last.x);
-            const diffY = Math.abs(detection.y - last.y);
-            const diffW = Math.abs(detection.w - last.w);
-            const diffH = Math.abs(detection.h - last.h);
+            const lumArr = new Uint8Array(sW * sH);
+            for (let i = 0; i < data.length; i += 4) {
+              lumArr[i / 4] = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+            }
 
-            if (diffX < 4 && diffY < 4 && diffW < 4 && diffH < 4) {
-              stabilityRef.current.frames++;
-              if (stabilityRef.current.frames >= AUTO_CAPTURE_FRAMES) {
-                setAutoScanReady(true);
+            // Corner average to pick mode
+            const cs = Math.round(sW * 0.08);
+            let cSum = 0, cCnt = 0;
+            for (let cy = 0; cy < cs; cy++) {
+              for (let cx = 0; cx < cs; cx++) {
+                cSum += lumArr[cy * sW + cx] + lumArr[cy * sW + (sW - 1 - cx)] +
+                        lumArr[(sH - 1 - cy) * sW + cx] + lumArr[(sH - 1 - cy) * sW + (sW - 1 - cx)];
+                cCnt += 4;
+              }
+            }
+            const cAvg = cSum / cCnt;
+
+            let minX = sW, minY = sH, maxX = 0, maxY = 0, found = 0;
+
+            if (cAvg < 130) {
+              // Dark background — Otsu threshold to find bright paper
+              const hist = new Int32Array(256);
+              for (let i = 0; i < lumArr.length; i++) hist[lumArr[i]]++;
+              const total = lumArr.length;
+              let sum = 0; for (let t = 0; t < 256; t++) sum += t * hist[t];
+              let sumB = 0, wB = 0, maxVar = 0, thresh = 128;
+              for (let t = 0; t < 256; t++) {
+                wB += hist[t]; if (!wB) continue;
+                const wF = total - wB; if (!wF) break;
+                sumB += t * hist[t];
+                const v = wB * wF * ((sumB / wB) - ((sum - sumB) / wF)) ** 2;
+                if (v > maxVar) { maxVar = v; thresh = t; }
+              }
+              thresh = Math.max(thresh, 140);
+              for (let y = 0; y < sH; y++) for (let x = 0; x < sW; x++) {
+                if (lumArr[y * sW + x] >= thresh) {
+                  if (x < minX) minX = x; if (x > maxX) maxX = x;
+                  if (y < minY) minY = y; if (y > maxY) maxY = y;
+                  found++;
+                }
+              }
+            } else {
+              minX = 2; minY = 2; maxX = sW - 3; maxY = sH - 3; found = 9999;
+            }
+
+            let detection = { x: 5, y: 5, w: 90, h: 90, confidence: 0 };
+            if (found > 100 && maxX > minX && maxY > minY) {
+              detection = {
+                x: Math.round((minX / sW) * 100),
+                y: Math.round((minY / sH) * 100),
+                w: Math.round(((maxX - minX) / sW) * 100),
+                h: Math.round(((maxY - minY) / sH) * 100),
+                confidence: found,
+              };
+            }
+
+            setLiveDetection(detection);
+
+            // Stability check
+            const last = stabilityRef.current.lastBounds;
+            if (last && detection.confidence > 200) {
+              const stable = Math.abs(detection.x - last.x) < 5 &&
+                             Math.abs(detection.y - last.y) < 5 &&
+                             Math.abs(detection.w - last.w) < 5 &&
+                             Math.abs(detection.h - last.h) < 5;
+              if (stable) {
+                stabilityRef.current.frames++;
+                if (stabilityRef.current.frames >= AUTO_CAPTURE_FRAMES) setAutoScanReady(true);
+              } else {
+                stabilityRef.current.frames = 0;
+                setAutoScanReady(false);
               }
             } else {
               stabilityRef.current.frames = 0;
               setAutoScanReady(false);
             }
-          } else {
-            stabilityRef.current.frames = 0;
-            setAutoScanReady(false);
-          }
-          stabilityRef.current.lastBounds = detection;
+            stabilityRef.current.lastBounds = detection;
 
-          // Draw overlay on transparent canvas overlay
-          overlayCanvas.width = overlayCanvas.offsetWidth;
-          overlayCanvas.height = overlayCanvas.offsetHeight;
-          const octx = overlayCanvas.getContext('2d');
-          octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-
-          if (detection.confidence > 100) {
-            const ox = (detection.x / 100) * overlayCanvas.width;
-            const oy = (detection.y / 100) * overlayCanvas.height;
-            const ow = (detection.w / 100) * overlayCanvas.width;
-            const oh = (detection.h / 100) * overlayCanvas.height;
+            // Draw overlay
+            const octx = overlay.getContext('2d');
+            octx.clearRect(0, 0, overlay.width, overlay.height);
 
             const isReady = stabilityRef.current.frames >= AUTO_CAPTURE_FRAMES;
-            const color = isReady ? 'rgba(34, 197, 94, 0.9)' : 'rgba(99, 102, 241, 0.9)';
-            const fillColor = isReady ? 'rgba(34, 197, 94, 0.08)' : 'rgba(99, 102, 241, 0.08)';
+            if (detection.confidence > 100) {
+              const ox = (detection.x / 100) * overlay.width;
+              const oy = (detection.y / 100) * overlay.height;
+              const ow = (detection.w / 100) * overlay.width;
+              const oh = (detection.h / 100) * overlay.height;
 
-            // Fill
-            octx.fillStyle = fillColor;
-            octx.fillRect(ox, oy, ow, oh);
+              const color = isReady ? 'rgba(34,197,94,0.95)' : 'rgba(99,102,241,0.95)';
+              const fill  = isReady ? 'rgba(34,197,94,0.10)' : 'rgba(99,102,241,0.10)';
 
-            // Border
-            octx.strokeStyle = color;
-            octx.lineWidth = 3;
-            octx.setLineDash([]);
-            octx.strokeRect(ox, oy, ow, oh);
+              octx.fillStyle = fill;
+              octx.fillRect(ox, oy, ow, oh);
+              octx.strokeStyle = color;
+              octx.lineWidth = 3;
+              octx.strokeRect(ox, oy, ow, oh);
 
-            // Corner handles
-            const handleSize = 14;
-            octx.fillStyle = color;
-            [[ox, oy], [ox + ow - handleSize, oy], [ox, oy + oh - handleSize], [ox + ow - handleSize, oy + oh - handleSize]].forEach(([hx, hy]) => {
-              octx.fillRect(hx, hy, handleSize, handleSize);
-            });
+              const hs = 16;
+              octx.fillStyle = color;
+              [[ox, oy], [ox + ow - hs, oy], [ox, oy + oh - hs], [ox + ow - hs, oy + oh - hs]].forEach(([hx, hy]) => {
+                octx.fillRect(hx, hy, hs, hs);
+              });
+            }
           }
         }
       }
@@ -256,10 +316,7 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
     };
 
     rafRef.current = requestAnimationFrame(analyzeFrame);
-
-    return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    };
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
   }, [isCameraActive]);
 
   // ─── Capture Frame + AI Crop + Add to Queue ─────────────────────────────────
