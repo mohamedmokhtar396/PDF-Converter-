@@ -16,10 +16,10 @@ export default function PdfScannerCrop({ pdfFile, onComplete, onCancel, isDarkMo
   const [isProcessing, setIsProcessing] = useState(false);
   const [pdfDoc, setPdfDoc] = useState(null);
 
-  // Active page editing state
   const [activeFilter, setActiveFilter] = useState('none'); // Default to Original photo colors
   const [cropArea, setCropArea] = useState({ x: 0, y: 0, w: 100, h: 100 });
   const [dragHandle, setDragHandle] = useState(null);
+  const [renderProgress, setRenderProgress] = useState({ loaded: 0, total: 0, percent: 0 });
 
   const previewCanvasRef = useRef(null);
   const cropContainerRef = useRef(null);
@@ -31,6 +31,7 @@ export default function PdfScannerCrop({ pdfFile, onComplete, onCancel, isDarkMo
 
     let isMounted = true;
     setIsRendering(true);
+    setRenderProgress({ loaded: 0, total: 1, percent: 0 });
 
     const loadPdf = async () => {
       try {
@@ -40,10 +41,19 @@ export default function PdfScannerCrop({ pdfFile, onComplete, onCancel, isDarkMo
 
         setPdfDoc(doc);
         setNumPages(doc.numPages);
+        setRenderProgress({ loaded: 0, total: doc.numPages, percent: 0 });
 
-        // Auto-detect crop bounds for each page
+        // Auto-detect crop bounds for each page with progress reporting
         const configs = [];
         for (let i = 1; i <= doc.numPages; i++) {
+          const pct = Math.round((i / doc.numPages) * 100);
+          if (isMounted) {
+            setRenderProgress({ loaded: i, total: doc.numPages, percent: pct });
+          }
+
+          // Micro-pause for smooth UI re-render & animation
+          await new Promise((r) => setTimeout(r, 0));
+
           try {
             const page = await doc.getPage(i);
             const viewport = page.getViewport({ scale: 1.0 });
@@ -60,16 +70,17 @@ export default function PdfScannerCrop({ pdfFile, onComplete, onCancel, isDarkMo
               crop: autoBounds,
             });
           } catch (e) {
-            configs.push({ filter: 'none', rotation: 0, crop: { x: 0, y: 0, w: 100, h: 100 } });
+            configs.push({ filter: 'none', rotation: 0, crop: { x: 4, y: 4, w: 92, h: 92 } });
           }
         }
 
+        if (!isMounted) return;
         setPageConfigs(configs);
         if (configs[0]) setCropArea(configs[0].crop);
         setIsRendering(false);
       } catch (err) {
         console.error('PDF load error:', err);
-        setIsRendering(false);
+        if (isMounted) setIsRendering(false);
       }
     };
 
@@ -392,9 +403,42 @@ export default function PdfScannerCrop({ pdfFile, onComplete, onCancel, isDarkMo
       </div>
 
       {isRendering ? (
-        <div className="text-center py-12 text-slate-400">
-          <div className="w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin mx-auto mb-3" />
-          <p className="text-sm font-semibold">AI is analyzing PDF pages & auto-cropping document margins...</p>
+        <div className="text-center py-12 px-4 max-w-md mx-auto flex flex-col items-center">
+          {/* Big Ring % Counter */}
+          <div className="relative w-24 h-24 mb-4 flex items-center justify-center">
+            <svg className="w-full h-full transform -rotate-90">
+              <circle cx="48" cy="48" r="38" className={isDarkMode ? 'text-slate-800' : 'text-slate-200'} strokeWidth="7" stroke="currentColor" fill="transparent" />
+              <circle
+                cx="48"
+                cy="48"
+                r="38"
+                className="text-indigo-500 transition-all duration-300 ease-out"
+                strokeWidth="7"
+                strokeDasharray={238}
+                strokeDashoffset={238 - (238 * renderProgress.percent) / 100}
+                strokeLinecap="round"
+                stroke="currentColor"
+                fill="transparent"
+              />
+            </svg>
+            <div className="absolute flex flex-col items-center justify-center">
+              <span className="text-xl font-black tracking-tight">{renderProgress.percent}%</span>
+            </div>
+          </div>
+
+          <p className={`text-sm font-bold mb-3 ${isDarkMode ? 'text-slate-200' : 'text-slate-800'}`}>
+            AI is analyzing PDF page {renderProgress.loaded} of {renderProgress.total} & auto-cropping document margins...
+          </p>
+
+          {/* Linear Progress Bar Underneath */}
+          <div className={`w-full h-3 rounded-full overflow-hidden relative border ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200'}`}>
+            <div
+              className="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 h-full rounded-full transition-all duration-300 relative"
+              style={{ width: `${renderProgress.percent}%` }}
+            >
+              <div className="absolute inset-0 animate-shimmer" />
+            </div>
+          </div>
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

@@ -178,8 +178,8 @@ export function sanitizeFileName(name, defaultExt = '') {
 }
 
 /**
- * Ultra-High Precision AI Document Paper Edge Detection (0-100%)
- * Automatically locates paper sheet boundaries vs desk/background
+ * Multi-Stage AI Sobel Edge & Document Margin Auto-Crop Detector (0-100%)
+ * Uses Sobel Gradient Magnitude to locate text, table edges, paper bounds, and stamps
  * @param {HTMLCanvasElement | HTMLImageElement} source
  * @returns {Promise<{x: number, y: number, w: number, h: number}>} Crop percentages (0..100)
  */
@@ -200,97 +200,75 @@ export async function detectDocumentCropBounds(source) {
       const imageData = ctx.getImageData(0, 0, sampleW, sampleH);
       const data = imageData.data;
 
-      const getPixelLum = (x, y) => {
-        const idx = (y * sampleW + x) * 4;
-        return 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-      };
-
-      // Sample outer border luminance (outer 4% frame)
-      let borderLumSum = 0;
-      let count = 0;
-      for (let x = 0; x < sampleW; x += 4) {
-        borderLumSum += getPixelLum(x, 2) + getPixelLum(x, sampleH - 3);
-        count += 2;
-      }
-      for (let y = 0; y < sampleH; y += 4) {
-        borderLumSum += getPixelLum(2, y) + getPixelLum(sampleW - 3, y);
-        count += 2;
-      }
-      const borderLum = borderLumSum / Math.max(1, count);
-
-      // 1. Find Top Edge (Top -> Down scan)
-      let topY = 0;
-      for (let y = 0; y < Math.round(sampleH * 0.45); y++) {
-        let matchCount = 0;
-        for (let x = Math.round(sampleW * 0.15); x < Math.round(sampleW * 0.85); x += 2) {
-          const lum = getPixelLum(x, y);
-          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
-        }
-        if (matchCount > Math.round(sampleW * 0.25)) {
-          topY = y;
-          break;
-        }
+      // Convert to luminance map
+      const lumMap = new Float32Array(sampleW * sampleH);
+      for (let i = 0; i < data.length; i += 4) {
+        lumMap[i / 4] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
       }
 
-      // 2. Find Bottom Edge (Bottom -> Up scan)
-      let bottomY = sampleH - 1;
-      for (let y = sampleH - 1; y > Math.round(sampleH * 0.55); y--) {
-        let matchCount = 0;
-        for (let x = Math.round(sampleW * 0.15); x < Math.round(sampleW * 0.85); x += 2) {
-          const lum = getPixelLum(x, y);
-          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
-        }
-        if (matchCount > Math.round(sampleW * 0.25)) {
-          bottomY = y;
-          break;
+      const getLum = (x, y) => lumMap[y * sampleW + x];
+
+      // Sobel Gradient Edge Detection
+      let minX = sampleW, minY = sampleH, maxX = 0, maxY = 0;
+      let edgePixelCount = 0;
+
+      for (let y = 1; y < sampleH - 1; y++) {
+        for (let x = 1; x < sampleW - 1; x++) {
+          // Horizontal Sobel gx
+          const gx =
+            -getLum(x - 1, y - 1) + getLum(x + 1, y - 1) +
+            -2 * getLum(x - 1, y) + 2 * getLum(x + 1, y) +
+            -getLum(x - 1, y + 1) + getLum(x + 1, y + 1);
+
+          // Vertical Sobel gy
+          const gy =
+            -getLum(x - 1, y - 1) - 2 * getLum(x, y - 1) - getLum(x + 1, y - 1) +
+             getLum(x - 1, y + 1) + 2 * getLum(x, y + 1) + getLum(x + 1, y + 1);
+
+          const mag = Math.abs(gx) + Math.abs(gy);
+
+          // If edge or text/table/stamp feature
+          if (mag > 35) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            edgePixelCount++;
+          }
         }
       }
 
-      // 3. Find Left Edge (Left -> Right scan)
-      let leftX = 0;
-      for (let x = 0; x < Math.round(sampleW * 0.45); x++) {
-        let matchCount = 0;
-        for (let y = Math.round(sampleH * 0.15); y < Math.round(sampleH * 0.85); y += 2) {
-          const lum = getPixelLum(x, y);
-          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
-        }
-        if (matchCount > Math.round(sampleH * 0.25)) {
-          leftX = x;
-          break;
-        }
-      }
+      // If document edges or text/table features detected
+      if (edgePixelCount > 30 && maxX > minX && maxY > minY) {
+        // Add 2% padding around content
+        const padX = Math.round(sampleW * 0.02);
+        const padY = Math.round(sampleH * 0.02);
 
-      // 4. Find Right Edge (Right -> Left scan)
-      let rightX = sampleW - 1;
-      for (let x = sampleW - 1; x > Math.round(sampleW * 0.55); x--) {
-        let matchCount = 0;
-        for (let y = Math.round(sampleH * 0.15); y < Math.round(sampleH * 0.85); y += 2) {
-          const lum = getPixelLum(x, y);
-          if (Math.abs(lum - borderLum) > 20 || lum > 140) matchCount++;
-        }
-        if (matchCount > Math.round(sampleH * 0.25)) {
-          rightX = x;
-          break;
+        const cropX = Math.max(0, minX - padX);
+        const cropY = Math.max(0, minY - padY);
+        const cropW = Math.min(sampleW - cropX, (maxX - minX) + (padX * 2));
+        const cropH = Math.min(sampleH - cropY, (maxY - minY) + (padY * 2));
+
+        const pctX = Math.round((cropX / sampleW) * 100);
+        const pctY = Math.round((cropY / sampleH) * 100);
+        const pctW = Math.round((cropW / sampleW) * 100);
+        const pctH = Math.round((cropH / sampleH) * 100);
+
+        if (pctW >= 25 && pctH >= 25 && (pctX > 0 || pctY > 0 || pctW < 98 || pctH < 98)) {
+          resolve({ x: pctX, y: pctY, w: pctW, h: pctH });
+          return;
         }
       }
 
-      let pctX = Math.round((leftX / sampleW) * 100);
-      let pctY = Math.round((topY / sampleH) * 100);
-      let pctW = Math.round(((rightX - leftX) / sampleW) * 100);
-      let pctH = Math.round(((bottomY - topY) / sampleH) * 100);
-
-      pctX = Math.max(0, pctX);
-      pctY = Math.max(0, pctY);
-      pctW = Math.min(100 - pctX, Math.max(30, pctW));
-      pctH = Math.min(100 - pctY, Math.max(30, pctH));
-
-      resolve({ x: pctX, y: pctY, w: pctW, h: pctH });
+      // Default smart document trim (4% margins)
+      resolve({ x: 4, y: 4, w: 92, h: 92 });
     } catch (e) {
       console.warn('AI Crop Detection error:', e);
-      resolve({ x: 0, y: 0, w: 100, h: 100 });
+      resolve({ x: 4, y: 4, w: 92, h: 92 });
     }
   });
 }
+
 
 
 
