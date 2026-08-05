@@ -17,7 +17,7 @@ import { convertImagesToWord } from './utils/imageToWord';
 import { convertPdfToImages } from './utils/pdfToImages';
 import { createThumbnailUrl } from './utils/helpers';
 import { translations } from './utils/translations';
-import { Play, Sparkles, Shield, Zap, FileCheck2, Camera } from 'lucide-react';
+import { Play, Sparkles, Shield, Zap, FileCheck2, Camera, Loader2 } from 'lucide-react';
 
 export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
@@ -27,6 +27,7 @@ export default function App() {
   const [options, setOptions] = useState({});
   const [isConverting, setIsConverting] = useState(false);
   const [progress, setProgress] = useState({ percent: 0, stage: '' });
+  const [uploadProgress, setUploadProgress] = useState({ isUploading: false, loaded: 0, total: 0, percent: 0, currentName: '' });
   const [conversionResult, setConversionResult] = useState(null);
   const [toast, setToast] = useState(null);
   const [showCameraModal, setShowCameraModal] = useState(false);
@@ -51,12 +52,18 @@ export default function App() {
     }
   };
 
-  // Process Files Selected from DropZone or Input with Memory-Safe Thumbnail Creation
+  // Process Files Selected from DropZone or Input with Real-time Progress Bar & Percent
   const handleFilesSelected = async (newFiles) => {
+    if (!newFiles || newFiles.length === 0) return;
     setConversionResult(null);
 
+    const total = newFiles.length;
+    if (total > 1 || newFiles[0].size > 3 * 1024 * 1024) {
+      setUploadProgress({ isUploading: true, loaded: 0, total, percent: 0, currentName: newFiles[0].name });
+    }
+
     const processed = [];
-    for (let i = 0; i < newFiles.length; i++) {
+    for (let i = 0; i < total; i++) {
       const file = newFiles[i];
       let preview = null;
 
@@ -75,7 +82,21 @@ export default function App() {
         size: file.size,
         preview,
       });
+
+      const percent = Math.round(((i + 1) / total) * 100);
+      setUploadProgress({
+        isUploading: true,
+        loaded: i + 1,
+        total,
+        percent,
+        currentName: file.name,
+      });
+
+      // Yield control for micro-pause to animate smooth percentage updates
+      await new Promise((r) => setTimeout(r, 0));
     }
+
+    setUploadProgress({ isUploading: false, loaded: 0, total: 0, percent: 0, currentName: '' });
 
     if (activeMode.multiple) {
       setFiles((prev) => [...prev, ...processed]);
@@ -384,6 +405,61 @@ export default function App() {
           isDarkMode={isDarkMode}
           t={t}
         />
+      )}
+
+      {/* File Loading & Processing Progress Overlay */}
+      {uploadProgress.isUploading && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-xl animate-fade-in">
+          <div className={`relative w-full max-w-md border rounded-3xl p-6 sm:p-8 shadow-2xl text-center flex flex-col items-center overflow-hidden ${
+            isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-200 text-slate-900'
+          }`}>
+            {/* Top Ambient Glow */}
+            <div className="absolute -top-24 left-1/2 -translate-x-1/2 w-64 h-64 bg-indigo-500/20 rounded-full blur-3xl pointer-events-none" />
+
+            {/* Big Ring % Counter */}
+            <div className="relative w-28 h-28 mb-4 flex items-center justify-center">
+              <svg className="w-full h-full transform -rotate-90">
+                <circle cx="56" cy="56" r="46" className={isDarkMode ? 'text-slate-800' : 'text-slate-200'} strokeWidth="8" stroke="currentColor" fill="transparent" />
+                <circle
+                  cx="56"
+                  cy="56"
+                  r="46"
+                  className="text-indigo-500 transition-all duration-300 ease-out"
+                  strokeWidth="8"
+                  strokeDasharray={289}
+                  strokeDashoffset={289 - (289 * uploadProgress.percent) / 100}
+                  strokeLinecap="round"
+                  stroke="currentColor"
+                  fill="transparent"
+                />
+              </svg>
+              <div className="absolute flex flex-col items-center justify-center">
+                <span className="text-2xl font-black tracking-tight">{uploadProgress.percent}%</span>
+                <Loader2 className="w-4 h-4 text-indigo-500 animate-spin mt-0.5" />
+              </div>
+            </div>
+
+            <h3 className="text-lg font-extrabold mb-1">
+              {lang === 'ar' ? 'جاري تحميل ومعالجة الملفات...' : 'Loading & Processing Files...'}
+            </h3>
+
+            <p className={`text-xs font-mono mb-4 px-2 truncate max-w-full ${isDarkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+              {lang === 'ar'
+                ? `الملف ${uploadProgress.loaded} من ${uploadProgress.total} (${uploadProgress.currentName})`
+                : `File ${uploadProgress.loaded} of ${uploadProgress.total} (${uploadProgress.currentName})`}
+            </p>
+
+            {/* Linear Progress Bar Underneath */}
+            <div className={`w-full h-3 rounded-full overflow-hidden relative border ${isDarkMode ? 'bg-slate-800 border-slate-700' : 'bg-slate-100 border-slate-200'}`}>
+              <div
+                className="bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 h-full rounded-full transition-all duration-300 relative"
+                style={{ width: `${uploadProgress.percent}%` }}
+              >
+                <div className="absolute inset-0 animate-shimmer" />
+              </div>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Progress Modal Overlay */}
