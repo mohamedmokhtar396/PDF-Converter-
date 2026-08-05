@@ -1,38 +1,128 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Camera, RefreshCw, Check, X, RotateCw, Wand2, Image as ImageIcon, Sparkles, Maximize, Crop, Scissors, CheckCircle2 } from 'lucide-react';
-import { applyScanFilterToCanvas, detectDocumentCropBounds } from '../utils/helpers';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { Camera, RefreshCw, X, ImageIcon, Sparkles, CheckCircle2, Zap, Eye } from 'lucide-react';
+import { applyScanFilterToCanvas } from '../utils/helpers';
 
+// =============================================================================
+// Inline Sobel Edge Document Detector - Runs directly on video frames
+// =============================================================================
+function detectDocumentInFrame(sourceCanvas) {
+  try {
+    const sampleW = 160; // Smaller for real-time performance
+    const imgW = sourceCanvas.width || 640;
+    const imgH = sourceCanvas.height || 480;
+    const sampleH = Math.round((imgH * sampleW) / imgW);
+
+    const sc = document.createElement('canvas');
+    sc.width = sampleW;
+    sc.height = sampleH;
+    const sctx = sc.getContext('2d');
+    sctx.drawImage(sourceCanvas, 0, 0, sampleW, sampleH);
+
+    const imageData = sctx.getImageData(0, 0, sampleW, sampleH);
+    const data = imageData.data;
+
+    // Build luminance map
+    const lum = new Float32Array(sampleW * sampleH);
+    for (let i = 0; i < data.length; i += 4) {
+      lum[i / 4] = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    }
+    const getLum = (x, y) => lum[y * sampleW + x];
+
+    // Sobel gradient detection
+    let minX = sampleW, minY = sampleH, maxX = 0, maxY = 0;
+    let edgeCount = 0;
+
+    for (let y = 1; y < sampleH - 1; y++) {
+      for (let x = 1; x < sampleW - 1; x++) {
+        const gx =
+          -getLum(x - 1, y - 1) + getLum(x + 1, y - 1) +
+          -2 * getLum(x - 1, y) + 2 * getLum(x + 1, y) +
+          -getLum(x - 1, y + 1) + getLum(x + 1, y + 1);
+        const gy =
+          -getLum(x - 1, y - 1) - 2 * getLum(x, y - 1) - getLum(x + 1, y - 1) +
+          getLum(x - 1, y + 1) + 2 * getLum(x, y + 1) + getLum(x + 1, y + 1);
+        const mag = Math.abs(gx) + Math.abs(gy);
+        if (mag > 40) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          edgeCount++;
+        }
+      }
+    }
+
+    if (edgeCount < 50 || maxX <= minX || maxY <= minY) {
+      return { x: 5, y: 5, w: 90, h: 90, confidence: 0 };
+    }
+
+    const pad = 2;
+    const cropX = Math.max(0, minX - pad);
+    const cropY = Math.max(0, minY - pad);
+    const cropW = Math.min(sampleW - cropX, (maxX - minX) + pad * 2);
+    const cropH = Math.min(sampleH - cropY, (maxY - minY) + pad * 2);
+
+    const pctX = Math.round((cropX / sampleW) * 100);
+    const pctY = Math.round((cropY / sampleH) * 100);
+    const pctW = Math.round((cropW / sampleW) * 100);
+    const pctH = Math.round((cropH / sampleH) * 100);
+
+    // Confidence score: how much did we trim vs original?
+    const trimmed = (pctX > 3 || pctY > 3 || pctW < 94 || pctH < 94);
+    const confidence = trimmed && pctW >= 25 && pctH >= 25 ? edgeCount : 0;
+
+    return { x: pctX, y: pctY, w: pctW, h: pctH, confidence };
+  } catch (e) {
+    return { x: 5, y: 5, w: 90, h: 90, confidence: 0 };
+  }
+}
+
+// Crop image canvas using percentage bounds
+function cropCanvasByBounds(source, bounds) {
+  const { x, y, w, h } = bounds;
+  const cx = Math.round((x / 100) * source.width);
+  const cy = Math.round((y / 100) * source.height);
+  const cw = Math.max(50, Math.round((w / 100) * source.width));
+  const ch = Math.max(50, Math.round((h / 100) * source.height));
+
+  const out = document.createElement('canvas');
+  out.width = cw;
+  out.height = ch;
+  const ctx = out.getContext('2d');
+  ctx.drawImage(source, cx, cy, cw, ch, 0, 0, cw, ch);
+  return out;
+}
+
+// =============================================================================
+// Main CameraScanner Component
+// =============================================================================
 export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, t = {} }) {
   const [stream, setStream] = useState(null);
-  const [facingMode, setFacingMode] = useState('environment'); // 'environment' or 'user'
-  const [capturedDataUrl, setCapturedDataUrl] = useState(null);
-  const [filter, setFilter] = useState('none'); // Default to Original photo colors
-  const [rotation, setRotation] = useState(0); // 0, 90, 180, 270
+  const [facingMode, setFacingMode] = useState('environment');
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState(null);
-  const [isAutoDetecting, setIsAutoDetecting] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
   const [scannedCount, setScannedCount] = useState(0);
-
-  // Interactive Photo Crop State (0-100% bounds)
-  const [cropArea, setCropArea] = useState({ x: 0, y: 0, w: 100, h: 100 });
-  const [dragHandle, setDragHandle] = useState(null);
+  const [scannedPreviews, setScannedPreviews] = useState([]); // Array of preview URLs
+  const [liveDetection, setLiveDetection] = useState({ x: 5, y: 5, w: 90, h: 90, confidence: 0 });
+  const [autoScanReady, setAutoScanReady] = useState(false); // true when doc is stable & ready
 
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
+  const overlayCanvasRef = useRef(null);
   const fileInputRef = useRef(null);
-  const imageContainerRef = useRef(null);
-  const startPosRef = useRef({ x: 0, y: 0, crop: { x: 0, y: 0, w: 100, h: 100 } });
+  const rafRef = useRef(null);
+  const stabilityRef = useRef({ frames: 0, lastBounds: null });
+  const AUTO_CAPTURE_FRAMES = 30; // ~1 second of stable detection before auto-capture notification
 
-  // Start Camera Stream with explicit Mobile Video Playback fixes (playsinline, muted)
-  const startCamera = async (mode = facingMode) => {
+  // ─── Start Camera ───────────────────────────────────────────────────────────
+  const startCamera = useCallback(async (mode) => {
     setCameraError(null);
     try {
-      if (stream) {
-        stream.getTracks().forEach((t) => t.stop());
-      }
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+
       const newStream = await navigator.mediaDevices.getUserMedia({
         video: {
-          facingMode: { ideal: mode },
+          facingMode: { ideal: mode || facingMode },
           width: { ideal: 1920 },
           height: { ideal: 1080 },
         },
@@ -43,71 +133,166 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
       setIsCameraActive(true);
 
       if (videoRef.current) {
-        const video = videoRef.current;
-        video.srcObject = newStream;
-        video.setAttribute('playsinline', 'true');
-        video.setAttribute('webkit-playsinline', 'true');
-        video.setAttribute('muted', 'true');
-        video.muted = true;
-        video.onloadedmetadata = () => {
-          video.play().catch((err) => console.warn('Video play error:', err));
+        const v = videoRef.current;
+        v.srcObject = newStream;
+        v.setAttribute('playsinline', '');
+        v.setAttribute('webkit-playsinline', '');
+        v.muted = true;
+        v.onloadedmetadata = () => {
+          v.play().catch(() => {});
         };
       }
     } catch (err) {
-      console.warn('Camera Access Error:', err);
-      setCameraError('Unable to access camera on mobile device. You can still upload photos below.');
+      console.warn('Camera error:', err);
+      setCameraError('Cannot access camera. Use photo upload below.');
       setIsCameraActive(false);
     }
-  };
+  }, [facingMode, stream]);
 
-  // Stop Camera Stream
-  const stopCamera = () => {
+  const stopCamera = useCallback(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
       setStream(null);
     }
-  };
+    setIsCameraActive(false);
+  }, [stream]);
 
   useEffect(() => {
-    startCamera();
-    return () => stopCamera();
+    startCamera(facingMode);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
   }, [facingMode]);
 
-  // Flip Camera Front / Back
-  const toggleFacingMode = () => {
-    setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'));
-  };
+  // ─── Real-Time Live Frame Analysis Loop ─────────────────────────────────────
+  useEffect(() => {
+    if (!isCameraActive) return;
 
-  // Process and Auto-Crop Canvas, then add directly to PDF queue
-  const processAndAddCroppedPhoto = async (sourceCanvas) => {
-    try {
-      setIsAutoDetecting(true);
-      const bounds = await detectDocumentCropBounds(sourceCanvas);
+    let frameSkip = 0;
+    const SKIP_FRAMES = 6; // Analyse every 6th frame for performance
 
-      const cropX = Math.round((bounds.x / 100) * sourceCanvas.width);
-      const cropY = Math.round((bounds.y / 100) * sourceCanvas.height);
-      const cropW = Math.max(50, Math.round((bounds.w / 100) * sourceCanvas.width));
-      const cropH = Math.max(50, Math.round((bounds.h / 100) * sourceCanvas.height));
+    const analyzeFrame = () => {
+      const video = videoRef.current;
+      const overlayCanvas = overlayCanvasRef.current;
 
-      const croppedCanvas = document.createElement('canvas');
-      croppedCanvas.width = cropW;
-      croppedCanvas.height = cropH;
-      const croppedCtx = croppedCanvas.getContext('2d');
-      croppedCtx.drawImage(sourceCanvas, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+      if (video && video.readyState >= 2 && overlayCanvas) {
+        frameSkip++;
+        if (frameSkip >= SKIP_FRAMES) {
+          frameSkip = 0;
 
-      if (filter !== 'none') {
-        applyScanFilterToCanvas(croppedCtx, cropW, cropH, filter);
+          // Draw video frame to temp canvas for analysis
+          const tempCanvas = document.createElement('canvas');
+          tempCanvas.width = video.videoWidth || 640;
+          tempCanvas.height = video.videoHeight || 480;
+          const tempCtx = tempCanvas.getContext('2d');
+          tempCtx.drawImage(video, 0, 0);
+
+          // Detect document bounds in this frame
+          const detection = detectDocumentInFrame(tempCanvas);
+
+          setLiveDetection(detection);
+
+          // Stability check: if same region detected for N frames → auto-ready
+          const last = stabilityRef.current.lastBounds;
+          if (last && detection.confidence > 200) {
+            const diffX = Math.abs(detection.x - last.x);
+            const diffY = Math.abs(detection.y - last.y);
+            const diffW = Math.abs(detection.w - last.w);
+            const diffH = Math.abs(detection.h - last.h);
+
+            if (diffX < 4 && diffY < 4 && diffW < 4 && diffH < 4) {
+              stabilityRef.current.frames++;
+              if (stabilityRef.current.frames >= AUTO_CAPTURE_FRAMES) {
+                setAutoScanReady(true);
+              }
+            } else {
+              stabilityRef.current.frames = 0;
+              setAutoScanReady(false);
+            }
+          } else {
+            stabilityRef.current.frames = 0;
+            setAutoScanReady(false);
+          }
+          stabilityRef.current.lastBounds = detection;
+
+          // Draw overlay on transparent canvas overlay
+          overlayCanvas.width = overlayCanvas.offsetWidth;
+          overlayCanvas.height = overlayCanvas.offsetHeight;
+          const octx = overlayCanvas.getContext('2d');
+          octx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+          if (detection.confidence > 100) {
+            const ox = (detection.x / 100) * overlayCanvas.width;
+            const oy = (detection.y / 100) * overlayCanvas.height;
+            const ow = (detection.w / 100) * overlayCanvas.width;
+            const oh = (detection.h / 100) * overlayCanvas.height;
+
+            const isReady = stabilityRef.current.frames >= AUTO_CAPTURE_FRAMES;
+            const color = isReady ? 'rgba(34, 197, 94, 0.9)' : 'rgba(99, 102, 241, 0.9)';
+            const fillColor = isReady ? 'rgba(34, 197, 94, 0.08)' : 'rgba(99, 102, 241, 0.08)';
+
+            // Fill
+            octx.fillStyle = fillColor;
+            octx.fillRect(ox, oy, ow, oh);
+
+            // Border
+            octx.strokeStyle = color;
+            octx.lineWidth = 3;
+            octx.setLineDash([]);
+            octx.strokeRect(ox, oy, ow, oh);
+
+            // Corner handles
+            const handleSize = 14;
+            octx.fillStyle = color;
+            [[ox, oy], [ox + ow - handleSize, oy], [ox, oy + oh - handleSize], [ox + ow - handleSize, oy + oh - handleSize]].forEach(([hx, hy]) => {
+              octx.fillRect(hx, hy, handleSize, handleSize);
+            });
+          }
+        }
       }
+
+      rafRef.current = requestAnimationFrame(analyzeFrame);
+    };
+
+    rafRef.current = requestAnimationFrame(analyzeFrame);
+
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, [isCameraActive]);
+
+  // ─── Capture Frame + AI Crop + Add to Queue ─────────────────────────────────
+  const captureAndProcess = useCallback(async (customBounds = null) => {
+    const video = videoRef.current;
+    if (!video || video.readyState < 2) return;
+
+    setIsCapturing(true);
+    setAutoScanReady(false);
+    stabilityRef.current.frames = 0;
+
+    try {
+      const w = video.videoWidth || 1280;
+      const h = video.videoHeight || 720;
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, 0, 0, w, h);
+
+      // Use live detection bounds or run fresh detection
+      const bounds = customBounds || liveDetection;
+      const croppedCanvas = cropCanvasByBounds(canvas, bounds);
 
       croppedCanvas.toBlob(
         (blob) => {
           if (!blob) return;
-          const fileName = `scanned_photo_${Date.now()}_${scannedCount + 1}.jpg`;
+          const fileName = `scanned_${Date.now()}.jpg`;
           const fileObj = new File([blob], fileName, { type: 'image/jpeg' });
           const previewUrl = URL.createObjectURL(blob);
 
           onAddPhoto({
-            id: `scan-${Date.now()}-${scannedCount}`,
+            id: `scan-${Date.now()}`,
             file: fileObj,
             name: fileName,
             size: blob.size,
@@ -115,368 +300,223 @@ export default function CameraScanner({ onAddPhoto, onClose, isDarkMode = true, 
           });
 
           setScannedCount((c) => c + 1);
+          setScannedPreviews((prev) => [...prev.slice(-3), previewUrl]);
         },
         'image/jpeg',
         0.88
       );
     } catch (e) {
-      console.warn('Auto process error:', e);
+      console.warn('Capture error:', e);
     } finally {
-      setIsAutoDetecting(false);
+      setIsCapturing(false);
     }
-  };
+  }, [liveDetection, onAddPhoto]);
 
-  // Capture Snapshot & Instant CamScanner Auto-Crop
-  const handleCapture = async () => {
-    if (!videoRef.current) return;
-    const video = videoRef.current;
-    const width = video.videoWidth || 1280;
-    const height = video.videoHeight || 720;
-
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(video, 0, 0, width, height);
-
-    // Auto Crop & Add directly to PDF queue
-    await processAndAddCroppedPhoto(canvas);
-  };
-
-  // Handle Photo File Upload (Multiple or Single)
+  // ─── Upload Gallery Photos ───────────────────────────────────────────────────
   const handleFileUpload = async (e) => {
-    const selectedFiles = Array.from(e.target.files || []);
-    if (selectedFiles.length === 0) return;
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
 
-    for (let i = 0; i < selectedFiles.length; i++) {
-      const file = selectedFiles[i];
-      const img = new Image();
-      const objUrl = URL.createObjectURL(file);
-      await new Promise((res) => {
-        img.onload = async () => {
+    for (const file of files) {
+      await new Promise((resolve) => {
+        const img = new Image();
+        const url = URL.createObjectURL(file);
+        img.onload = () => {
           const canvas = document.createElement('canvas');
-          canvas.width = img.naturalWidth || img.width;
-          canvas.height = img.naturalHeight || img.height;
+          canvas.width = img.naturalWidth;
+          canvas.height = img.naturalHeight;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0);
 
-          await processAndAddCroppedPhoto(canvas);
-          URL.revokeObjectURL(objUrl);
-          res();
+          const bounds = detectDocumentInFrame(canvas);
+          const croppedCanvas = cropCanvasByBounds(canvas, bounds);
+
+          croppedCanvas.toBlob(
+            (blob) => {
+              if (!blob) { resolve(); return; }
+              const fileName = `scanned_${Date.now()}.jpg`;
+              const fileObj = new File([blob], fileName, { type: 'image/jpeg' });
+              const previewUrl = URL.createObjectURL(blob);
+
+              onAddPhoto({
+                id: `scan-${Date.now()}`,
+                file: fileObj,
+                name: fileName,
+                size: blob.size,
+                preview: previewUrl,
+              });
+
+              setScannedCount((c) => c + 1);
+              setScannedPreviews((prev) => [...prev.slice(-3), previewUrl]);
+              URL.revokeObjectURL(url);
+              resolve();
+            },
+            'image/jpeg',
+            0.88
+          );
         };
-        img.src = objUrl;
+        img.src = url;
       });
     }
   };
 
-  // Render Preview Canvas for manual inspection if needed
-  useEffect(() => {
-    if (!capturedDataUrl || !canvasRef.current) return;
-
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      const canvas = canvasRef.current;
-      let w = img.naturalWidth || img.width;
-      let h = img.naturalHeight || img.height;
-
-      if (rotation === 90 || rotation === 270) {
-        canvas.width = h;
-        canvas.height = w;
-      } else {
-        canvas.width = w;
-        canvas.height = h;
-      }
-
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      ctx.save();
-      if (rotation === 90) {
-        ctx.translate(canvas.width, 0);
-        ctx.rotate((90 * Math.PI) / 180);
-      } else if (rotation === 180) {
-        ctx.translate(canvas.width, canvas.height);
-        ctx.rotate((180 * Math.PI) / 180);
-      } else if (rotation === 270) {
-        ctx.translate(0, canvas.height);
-        ctx.rotate((270 * Math.PI) / 180);
-      }
-      ctx.drawImage(img, 0, 0, w, h);
-      ctx.restore();
-
-      if (filter !== 'none') {
-        applyScanFilterToCanvas(ctx, canvas.width, canvas.height, filter);
-      }
-    };
-    img.src = capturedDataUrl;
-  }, [capturedDataUrl, filter, rotation]);
-
-  // Direct On-Image Drag Corner Logic
-  const handleDragStart = (e, handle) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    setDragHandle(handle);
-    startPosRef.current = {
-      x: clientX,
-      y: clientY,
-      crop: { ...cropArea },
-    };
+  const toggleCamera = () => {
+    setFacingMode((prev) => (prev === 'environment' ? 'user' : 'environment'));
+    stabilityRef.current = { frames: 0, lastBounds: null };
+    setAutoScanReady(false);
   };
 
-  const handleDragMove = (e) => {
-    if (!dragHandle || !imageContainerRef.current) return;
-    const rect = imageContainerRef.current.getBoundingClientRect();
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-
-    const dxPct = ((clientX - startPosRef.current.x) / rect.width) * 100;
-    const dyPct = ((clientY - startPosRef.current.y) / rect.height) * 100;
-    const initial = startPosRef.current.crop;
-
-    setCropArea(() => {
-      let { x, y, w, h } = initial;
-
-      if (dragHandle === 'nw') {
-        const newX = Math.max(0, Math.min(initial.x + initial.w - 10, initial.x + dxPct));
-        const newY = Math.max(0, Math.min(initial.y + initial.h - 10, initial.y + dyPct));
-        x = newX;
-        y = newY;
-        w = initial.x + initial.w - newX;
-        h = initial.y + initial.h - newY;
-      } else if (dragHandle === 'ne') {
-        const newY = Math.max(0, Math.min(initial.y + initial.h - 10, initial.y + dyPct));
-        const newW = Math.max(10, Math.min(100 - initial.x, initial.w + dxPct));
-        y = newY;
-        w = newW;
-        h = initial.y + initial.h - newY;
-      } else if (dragHandle === 'sw') {
-        const newX = Math.max(0, Math.min(initial.x + initial.w - 10, initial.x + dxPct));
-        const newH = Math.max(10, Math.min(100 - initial.y, initial.h + dyPct));
-        x = newX;
-        w = initial.x + initial.w - newX;
-        h = newH;
-      } else if (dragHandle === 'se') {
-        const newW = Math.max(10, Math.min(100 - initial.x, initial.w + dxPct));
-        const newH = Math.max(10, Math.min(100 - initial.y, initial.h + dyPct));
-        w = newW;
-        h = newH;
-      } else if (dragHandle === 'move') {
-        x = Math.max(0, Math.min(100 - initial.w, initial.x + dxPct));
-        y = Math.max(0, Math.min(100 - initial.h, initial.y + dyPct));
-      }
-
-      return {
-        x: Math.round(x),
-        y: Math.round(y),
-        w: Math.round(w),
-        h: Math.round(h),
-      };
-    });
-  };
-
-  const handleDragEnd = () => {
-    setDragHandle(null);
-  };
-
-  useEffect(() => {
-    if (dragHandle) {
-      window.addEventListener('mousemove', handleDragMove);
-      window.addEventListener('mouseup', handleDragEnd);
-      window.addEventListener('touchmove', handleDragMove);
-      window.addEventListener('touchend', handleDragEnd);
-    }
-    return () => {
-      window.removeEventListener('mousemove', handleDragMove);
-      window.removeEventListener('mouseup', handleDragEnd);
-      window.removeEventListener('touchmove', handleDragMove);
-      window.removeEventListener('touchend', handleDragEnd);
-    };
-  }, [dragHandle]);
-
-  const modalBg = isDarkMode ? 'bg-slate-900 border-indigo-500/30 text-white' : 'bg-white border-slate-200 text-slate-900 shadow-2xl';
-
+  // ─── UI ─────────────────────────────────────────────────────────────────────
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-xl flex items-center justify-center p-4 sm:p-6 overflow-y-auto">
-      <div className={`border rounded-3xl w-full max-w-3xl overflow-hidden shadow-2xl flex flex-col max-h-[92vh] ${modalBg}`}>
-        
-        {/* Modal Header */}
-        <div className={`p-4 sm:p-5 border-b flex items-center justify-between ${isDarkMode ? 'border-slate-800 bg-slate-950/50' : 'border-slate-200 bg-slate-50'}`}>
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-indigo-600/20 border border-indigo-500/40 flex items-center justify-center">
-              <Camera className="w-5 h-5 text-indigo-500" />
-            </div>
-            <div>
-              <h3 className="font-extrabold text-base sm:text-lg flex items-center gap-2">
-                <span>{t.scannerTitle || 'Mobile Photo Scanner & AI Auto-Crop'}</span>
-                <Sparkles className="w-4 h-4 text-amber-500 animate-pulse" />
-              </h3>
-              <p className={`text-xs ${isDarkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-                Snap or upload photos — AI automatically crops document paper & builds your PDF
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2">
-            {scannedCount > 0 && (
-              <button
-                onClick={() => {
-                  stopCamera();
-                  onClose();
-                }}
-                className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1 shadow-md"
-              >
-                <CheckCircle2 className="w-4 h-4" />
-                <span>Finish ({scannedCount} photos)</span>
-              </button>
-            )}
-
-            <button
-              onClick={() => {
-                stopCamera();
-                onClose();
-              }}
-              className={`p-2 rounded-xl border transition-colors ${
-                isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white' : 'bg-slate-100 border-slate-200 text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
+    <div className="fixed inset-0 z-50 bg-black flex flex-col">
+      
+      {/* Header Bar */}
+      <div className="absolute top-0 left-0 right-0 z-20 flex items-center justify-between px-4 py-3"
+        style={{ background: 'linear-gradient(to bottom, rgba(0,0,0,0.7), transparent)' }}>
+        <div className="flex items-center gap-2">
+          <Sparkles className="w-4 h-4 text-amber-400 animate-pulse" />
+          <span className="text-white text-sm font-bold">
+            AI Document Scanner
+          </span>
         </div>
 
-        {/* Modal Main Viewport */}
-        <div className="flex-1 overflow-y-auto p-4 sm:p-6 flex flex-col items-center justify-center">
-          {!capturedDataUrl ? (
-            /* Live Camera Feed View */
-            <div className="w-full max-w-lg flex flex-col items-center gap-4">
-              
-              {/* Scanned Badge Counter */}
-              {scannedCount > 0 && (
-                <div className="px-4 py-1.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 text-xs font-bold flex items-center gap-1.5 animate-bounce">
-                  <CheckCircle2 className="w-4 h-4" />
-                  <span>{scannedCount} scanned document photo(s) added to PDF queue!</span>
+        <div className="flex items-center gap-2">
+          {scannedCount > 0 && (
+            <button
+              onClick={() => { stopCamera(); onClose(); }}
+              className="px-3 py-1.5 rounded-xl bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-lg"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              <span>Done ({scannedCount})</span>
+            </button>
+          )}
+          <button
+            onClick={() => { stopCamera(); onClose(); }}
+            className="p-2 rounded-full bg-black/50 text-white border border-white/20"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Camera Viewport - Full Screen */}
+      <div className="relative flex-1 bg-black overflow-hidden">
+        {isCameraActive ? (
+          <>
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+            {/* Real-time AI Detection Overlay Canvas */}
+            <canvas
+              ref={overlayCanvasRef}
+              className="absolute inset-0 w-full h-full pointer-events-none"
+              style={{ zIndex: 10 }}
+            />
+
+            {/* Status indicator */}
+            <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20">
+              {autoScanReady ? (
+                <div className="px-4 py-2 rounded-full bg-emerald-500 text-white text-xs font-bold flex items-center gap-2 shadow-lg animate-bounce">
+                  <Zap className="w-4 h-4" />
+                  <span>Document Detected! Tap to Capture!</span>
+                </div>
+              ) : liveDetection.confidence > 100 ? (
+                <div className="px-4 py-2 rounded-full bg-indigo-500/80 text-white text-xs font-bold flex items-center gap-2 backdrop-blur">
+                  <Eye className="w-4 h-4 animate-pulse" />
+                  <span>Scanning for document edges...</span>
+                </div>
+              ) : (
+                <div className="px-4 py-2 rounded-full bg-black/50 text-white/70 text-xs font-semibold flex items-center gap-2 backdrop-blur border border-white/10">
+                  <Camera className="w-4 h-4" />
+                  <span>Point camera at a document</span>
                 </div>
               )}
-
-              <div className="relative w-full aspect-[4/3] bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 flex items-center justify-center shadow-inner">
-                {isCameraActive ? (
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    playsInline
-                    webkit-playsinline="true"
-                    muted
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <div className="text-center p-6">
-                    <Camera className="w-12 h-12 text-slate-600 mx-auto mb-2" />
-                    <p className="text-xs text-slate-400 max-w-xs mx-auto">
-                      {cameraError || 'Camera stream initializing...'}
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              {/* Camera Action Controls */}
-              <div className="flex items-center justify-center gap-6 w-full pt-2">
-                {isCameraActive && (
-                  <button
-                    onClick={toggleFacingMode}
-                    className="p-3.5 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 shadow-md"
-                    title="Switch Camera"
-                  >
-                    <RefreshCw className="w-5 h-5" />
-                  </button>
-                )}
-
-                {isCameraActive && (
-                  <button
-                    onClick={handleCapture}
-                    disabled={isAutoDetecting}
-                    className="w-18 h-18 rounded-full bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:scale-105 active:scale-95 shadow-2xl shadow-indigo-500/50 flex items-center justify-center border-4 border-white transition-transform"
-                    title="Snap Document Photo"
-                  >
-                    <div className="w-8 h-8 rounded-full bg-white flex items-center justify-center">
-                      {isAutoDetecting && <div className="w-4 h-4 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />}
-                    </div>
-                  </button>
-                )}
-
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="p-3.5 rounded-full bg-slate-800 hover:bg-slate-700 text-indigo-400 hover:text-indigo-300 border border-slate-700 flex items-center justify-center shadow-md"
-                  title="Upload Photos from Gallery"
-                >
-                  <ImageIcon className="w-5 h-5" />
-                </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  multiple
-                  onChange={handleFileUpload}
-                  className="hidden"
-                />
-              </div>
-
-              <p className="text-[11px] text-slate-400 text-center font-medium">
-                Tap photo button to snap & AI auto-crops paper directly into PDF!
-              </p>
             </div>
-          ) : (
-            /* Manual Inspection & Adjustment View if Triggered */
-            <div className="w-full max-w-xl flex flex-col items-center gap-4">
-              <div
-                ref={imageContainerRef}
-                className="relative max-h-[380px] max-w-full overflow-hidden rounded-2xl border border-slate-700 bg-slate-950 flex items-center justify-center shadow-2xl select-none"
-              >
-                <canvas ref={canvasRef} className="max-h-[380px] max-w-full object-contain pointer-events-none" />
 
-                <div
-                  onMouseDown={(e) => handleDragStart(e, 'move')}
-                  onTouchStart={(e) => handleDragStart(e, 'move')}
-                  className="absolute border-2 border-indigo-400 bg-indigo-500/15 rounded-lg cursor-grab active:cursor-grabbing shadow-2xl"
-                  style={{
-                    left: `${cropArea.x}%`,
-                    top: `${cropArea.y}%`,
-                    width: `${cropArea.w}%`,
-                    height: `${cropArea.h}%`,
-                  }}
-                >
-                  <span className="absolute top-1.5 left-1.5 px-2 py-0.5 rounded bg-indigo-600 text-white font-mono text-[9px] font-bold pointer-events-none flex items-center gap-1 shadow-sm">
-                    <Crop className="w-3 h-3" /> Auto Crop
-                  </span>
-
-                  <div onMouseDown={(e) => handleDragStart(e, 'nw')} onTouchStart={(e) => handleDragStart(e, 'nw')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -top-2.5 -left-2.5 cursor-nwse-resize touch-none shadow-lg" />
-                  <div onMouseDown={(e) => handleDragStart(e, 'ne')} onTouchStart={(e) => handleDragStart(e, 'ne')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -top-2.5 -right-2.5 cursor-nesw-resize touch-none shadow-lg" />
-                  <div onMouseDown={(e) => handleDragStart(e, 'sw')} onTouchStart={(e) => handleDragStart(e, 'sw')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -bottom-2.5 -left-2.5 cursor-nesw-resize touch-none shadow-lg" />
-                  <div onMouseDown={(e) => handleDragStart(e, 'se')} onTouchStart={(e) => handleDragStart(e, 'se')} className="w-5 h-5 bg-indigo-500 border-2 border-white rounded-full absolute -bottom-2.5 -right-2.5 cursor-nwse-resize touch-none shadow-lg" />
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3 w-full">
-                <button
-                  onClick={() => {
-                    setCapturedDataUrl(null);
-                    startCamera();
-                  }}
-                  className={`flex-1 py-3 px-4 rounded-xl border text-xs font-bold flex items-center justify-center gap-1.5 ${
-                    isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-slate-100 border-slate-300 text-slate-700'
-                  }`}
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Snap Another</span>
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-
+          </>
+        ) : (
+          <div className="absolute inset-0 flex flex-col items-center justify-center text-white gap-4">
+            <Camera className="w-16 h-16 text-slate-500" />
+            <p className="text-sm text-slate-400 text-center px-8 max-w-xs">
+              {cameraError || 'Starting camera...'}
+            </p>
+            <button
+              onClick={() => startCamera(facingMode)}
+              className="px-4 py-2 rounded-xl bg-indigo-600 text-white text-sm font-bold"
+            >
+              Retry Camera
+            </button>
+          </div>
+        )}
       </div>
+
+      {/* Bottom Controls Bar */}
+      <div className="absolute bottom-0 left-0 right-0 z-20 pb-8 pt-4 px-6 flex items-center justify-between"
+        style={{ background: 'linear-gradient(to top, rgba(0,0,0,0.85), transparent)' }}>
+
+        {/* Gallery Upload */}
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="flex flex-col items-center gap-1"
+        >
+          <div className="w-12 h-12 rounded-xl bg-black/60 border border-white/30 flex items-center justify-center overflow-hidden">
+            {scannedPreviews.length > 0 ? (
+              <img src={scannedPreviews[scannedPreviews.length - 1]} alt="last" className="w-full h-full object-cover" />
+            ) : (
+              <ImageIcon className="w-5 h-5 text-white" />
+            )}
+          </div>
+          <span className="text-white/60 text-[10px] font-medium">Gallery</span>
+        </button>
+        <input ref={fileInputRef} type="file" accept="image/*" multiple onChange={handleFileUpload} className="hidden" />
+
+        {/* Main Capture Button */}
+        <button
+          onClick={() => captureAndProcess()}
+          disabled={isCapturing}
+          className={`w-20 h-20 rounded-full border-4 flex items-center justify-center shadow-2xl transition-all active:scale-95 ${
+            autoScanReady
+              ? 'border-emerald-400 bg-emerald-500 shadow-emerald-500/50 scale-110'
+              : 'border-white bg-white/20'
+          }`}
+        >
+          <div className={`w-14 h-14 rounded-full flex items-center justify-center ${
+            autoScanReady ? 'bg-emerald-400' : 'bg-white'
+          }`}>
+            {isCapturing
+              ? <div className="w-6 h-6 border-3 border-slate-800 border-t-transparent rounded-full animate-spin" />
+              : autoScanReady
+              ? <Zap className="w-7 h-7 text-white" />
+              : null
+            }
+          </div>
+        </button>
+
+        {/* Flip Camera */}
+        <button
+          onClick={toggleCamera}
+          className="flex flex-col items-center gap-1"
+        >
+          <div className="w-12 h-12 rounded-xl bg-black/60 border border-white/30 flex items-center justify-center">
+            <RefreshCw className="w-5 h-5 text-white" />
+          </div>
+          <span className="text-white/60 text-[10px] font-medium">Flip</span>
+        </button>
+      </div>
+
+      {/* Scanned counter badge */}
+      {scannedCount > 0 && (
+        <div className="absolute bottom-36 left-1/2 -translate-x-1/2 z-20">
+          <div className="px-4 py-1.5 rounded-full bg-black/60 text-white text-xs font-bold border border-white/20 backdrop-blur flex items-center gap-1.5">
+            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+            <span>{scannedCount} scanned</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
